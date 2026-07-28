@@ -2057,7 +2057,8 @@ func (api *API) CreateUser(ctx context.Context, store database.Store, req Create
 				"created_account_name":      user.Username,
 				"created_account_user_name": user.Name,
 				"initiator":                 req.accountCreatorName,
-				"account_type":              accountType,
+				// The notification template branches on this. See migration 000560.
+				"created_account_type": accountType,
 			},
 			map[string]any{
 				"user": map[string]any{"id": user.ID, "name": user.Name, "email": user.Email},

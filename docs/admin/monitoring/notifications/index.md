@@ -36,7 +36,7 @@ These notifications are sent to users with **template admin** roles:
 These notifications are sent to users with **owner** and **user admin** roles:
 
 - User account activated
-- User account created
+- User account created (includes service accounts)
 - User account deleted
 - User account suspended
 
