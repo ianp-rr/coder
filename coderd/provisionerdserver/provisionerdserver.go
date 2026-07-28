@@ -349,9 +349,10 @@ func (s *server) keyDeleted(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	_, err := s.Database.GetProvisionerKeyByID(
-		//nolint:gocritic // The provisionerd actor cannot read provisioner keys,
-		// so use system restricted to look up the key.
-		dbauthz.AsSystemRestricted(ctx), s.KeyID)
+		//nolint:gocritic // The provisionerd actor cannot read provisioner keys;
+		// a provisioner key's RBACObject is a provisioner daemon, so this role
+		// is sufficient to look it up.
+		dbauthz.AsSystemReadProvisionerDaemons(ctx), s.KeyID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return true, nil
 	}
