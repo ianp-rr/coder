@@ -24,7 +24,9 @@ import (
 	"github.com/coder/coder/v2/coderd/database/db2sdk"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
+	dbpubsub "github.com/coder/coder/v2/coderd/database/pubsub"
 	"github.com/coder/coder/v2/coderd/provisionerkey"
+	"github.com/coder/coder/v2/coderd/pubsub"
 	"github.com/coder/coder/v2/coderd/rbac"
 	"github.com/coder/coder/v2/coderd/util/ptr"
 	"github.com/coder/coder/v2/codersdk"
@@ -276,6 +278,83 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		// Confirm the close was driven by the re-check's key lookup, not another
 		// path (no pubsub notification is published in this test).
 		require.True(t, store.deleted.Load())
+	})
+
+	t.Run("DroppedMessageClosesSession", func(t *testing.T) {
+		t.Parallel()
+		// A dropped-messages signal is delivered when the Postgres listener
+		// reconnects. If the key was deleted while the listener was down, the
+		// deletion notification is never delivered, so the serve handler must
+		// re-check the key on the dropped-messages signal. This test deletes
+		// the key directly in the database (no notification published) and then
+		// drives the captured listener with ErrDroppedMessages.
+		db, ps := dbtestutil.NewDB(t)
+		capturePS := newCaptureKeyDeletePubsub(ps)
+		client, _ := coderdenttest.New(t, &coderdenttest.Options{
+			Options: &coderdtest.Options{
+				Database: db,
+				Pubsub:   capturePS,
+				// The wrapper is not a *PGPubsub, so provide the real one for
+				// replica sync.
+				ReplicaSyncPubsub: ps.(*dbpubsub.PGPubsub),
+			},
+			LicenseOptions: &coderdenttest.LicenseOptions{
+				Features: license.Features{
+					codersdk.FeatureExternalProvisionerDaemons: 1,
+					codersdk.FeatureMultipleOrganizations:      1,
+				},
+			},
+		})
+		org := coderdenttest.CreateOrganization(t, client, coderdenttest.CreateOrganizationOptions{})
+		orgAdmin, _ := coderdtest.CreateAnotherUser(t, client, org.ID, rbac.ScopedRoleOrgAdmin(org.ID))
+		ctx := testutil.Context(t, testutil.WaitLong)
+
+		res, err := orgAdmin.CreateProvisionerKey(ctx, org.ID, codersdk.CreateProvisionerKeyRequest{
+			Name: "my-key",
+		})
+		require.NoError(t, err)
+		keys, err := orgAdmin.ListProvisionerKeys(ctx, org.ID)
+		require.NoError(t, err)
+		require.Len(t, keys, 1)
+		keyID := keys[0].ID
+		capturePS.target.Store(ptr.Ref(pubsub.ProvisionerKeyDeletedChannel(keyID)))
+
+		srv, err := orgAdmin.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
+			Name:         testutil.MustRandString(t, 63),
+			Organization: org.ID,
+			Provisioners: []codersdk.ProvisionerType{
+				codersdk.ProvisionerTypeEcho,
+			},
+			Tags:           map[string]string{},
+			ProvisionerKey: res.Key,
+		})
+		require.NoError(t, err)
+		defer srv.DRPCConn().Close()
+
+		// Capture the listener the serve handler registered for this key.
+		listener := capturePS.waitListener(ctx, t)
+
+		// The session is established and open.
+		select {
+		case <-srv.DRPCConn().Closed():
+			t.Fatal("connection closed before key deletion")
+		default:
+		}
+
+		// Delete the key without publishing, simulating a deletion missed while
+		// the listener was down.
+		//nolint:gocritic // The test deletes the key outside the request actor.
+		err = db.DeleteProvisionerKey(dbauthz.AsSystemRestricted(ctx), keyID)
+		require.NoError(t, err)
+
+		// Deliver the dropped-messages signal the reconnect would have produced.
+		listener(ctx, nil, dbpubsub.ErrDroppedMessages)
+
+		select {
+		case <-srv.DRPCConn().Closed():
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for dropped-message re-check to close the session")
+		}
 	})
 
 	t.Run("NoLicense", func(t *testing.T) {
@@ -1114,4 +1193,48 @@ func (s *deleteKeyOnReadStore) GetProvisionerKeyByID(ctx context.Context, id uui
 		})
 	}
 	return s.Store.GetProvisionerKeyByID(ctx, id)
+}
+
+// captureKeyDeletePubsub records the ListenerWithErr registered for the channel
+// named by target so a test can invoke it directly, e.g. with
+// ErrDroppedMessages. All other pubsub operations pass through to the embedded
+// Pubsub unchanged. target is set before the subscription is expected so the
+// capturing subscribe observes it.
+type captureKeyDeletePubsub struct {
+	dbpubsub.Pubsub
+	target   atomic.Pointer[string]
+	mu       sync.Mutex
+	listener dbpubsub.ListenerWithErr
+	once     sync.Once
+	got      chan struct{}
+}
+
+func newCaptureKeyDeletePubsub(ps dbpubsub.Pubsub) *captureKeyDeletePubsub {
+	return &captureKeyDeletePubsub{Pubsub: ps, got: make(chan struct{})}
+}
+
+func (p *captureKeyDeletePubsub) SubscribeWithErr(event string, listener dbpubsub.ListenerWithErr) (func(), error) {
+	cancel, err := p.Pubsub.SubscribeWithErr(event, listener)
+	if err != nil {
+		return cancel, err
+	}
+	if target := p.target.Load(); target != nil && *target == event {
+		p.mu.Lock()
+		p.listener = listener
+		p.mu.Unlock()
+		p.once.Do(func() { close(p.got) })
+	}
+	return cancel, nil
+}
+
+func (p *captureKeyDeletePubsub) waitListener(ctx context.Context, t *testing.T) dbpubsub.ListenerWithErr {
+	t.Helper()
+	select {
+	case <-p.got:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for provisioner key deletion subscription")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.listener
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
+	dbpubsub "github.com/coder/coder/v2/coderd/database/pubsub"
 	"github.com/coder/coder/v2/coderd/httpapi"
 	"github.com/coder/coder/v2/coderd/httpmw"
 	"github.com/coder/coder/v2/coderd/httpmw/loggermw"
@@ -395,9 +396,32 @@ func (api *API) provisionerDaemonServe(rw http.ResponseWriter, r *http.Request) 
 	}
 
 	if codersdk.IsDeletableProvisionerKey(authRes.keyID) {
-		closeSubscribe, err := api.Pubsub.Subscribe(
+		keyDeleted := func(ctx context.Context) (deleted bool, err error) {
+			_, err = api.Database.GetProvisionerKeyByID(ctx, authRes.keyID)
+			if xerrors.Is(err, sql.ErrNoRows) {
+				return true, nil
+			}
+			return false, err
+		}
+
+		closeSubscribe, err := api.Pubsub.SubscribeWithErr(
 			pubsub.ProvisionerKeyDeletedChannel(authRes.keyID),
-			func(_ context.Context, _ []byte) {
+			func(_ context.Context, _ []byte, subErr error) {
+				// ErrDroppedMessages means the Postgres listener reconnected; a
+				// deletion published during the outage may not have been
+				// delivered, so query the key directly instead of relying on the
+				// notification.
+				if xerrors.Is(subErr, dbpubsub.ErrDroppedMessages) {
+					deleted, err := keyDeleted(authCtx)
+					if err != nil {
+						logger.Warn(ctx, "failed to re-check provisioner key after dropped messages",
+							slog.F("provisioner_key_id", authRes.keyID), slog.Error(err))
+						return
+					}
+					if !deleted {
+						return
+					}
+				}
 				logger.Info(ctx, "provisioner key deleted, canceling session",
 					slog.F("provisioner_key_id", authRes.keyID))
 				srvCancel()
@@ -411,15 +435,13 @@ func (api *API) provisionerDaemonServe(rw http.ResponseWriter, r *http.Request) 
 
 		// Postgres LISTEN/NOTIFY does not deliver notifications published before
 		// registration, so re-check after subscribing.
-		_, err = api.Database.GetProvisionerKeyByID(authCtx, authRes.keyID)
-		if xerrors.Is(err, sql.ErrNoRows) {
+		if deleted, err := keyDeleted(authCtx); err != nil {
+			_ = conn.Close(websocket.StatusInternalError, httpapi.WebsocketCloseSprintf("check provisioner key: %s", err))
+			return
+		} else if deleted {
 			logger.Info(ctx, "provisioner key no longer exists, closing connection",
 				slog.F("provisioner_key_id", authRes.keyID))
 			_ = conn.Close(websocket.StatusGoingAway, "provisioner key deleted")
-			return
-		}
-		if err != nil {
-			_ = conn.Close(websocket.StatusInternalError, httpapi.WebsocketCloseSprintf("check provisioner key: %s", err))
 			return
 		}
 	}
