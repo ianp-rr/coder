@@ -2380,6 +2380,65 @@ func TestAcquireProvisionerJob(t *testing.T) {
 		})
 		require.ErrorIs(t, err, sql.ErrNoRows)
 	})
+
+	t.Run("ProvisionerKeyGuard", func(t *testing.T) {
+		t.Parallel()
+		var (
+			db, _ = dbtestutil.NewDB(t)
+			ctx   = testutil.Context(t, testutil.WaitMedium)
+			org   = dbgen.Organization(t, db, database.Organization{})
+			key   = dbgen.ProvisionerKey(t, db, database.ProvisionerKey{OrganizationID: org.ID})
+			now   = dbtime.Now()
+		)
+
+		insertPendingJob := func() database.ProvisionerJob {
+			job, err := db.InsertProvisionerJob(ctx, database.InsertProvisionerJobParams{
+				ID:             uuid.New(),
+				CreatedAt:      now,
+				UpdatedAt:      now,
+				InitiatorID:    uuid.New(),
+				OrganizationID: org.ID,
+				Provisioner:    database.ProvisionerTypeEcho,
+				Type:           database.ProvisionerJobTypeWorkspaceBuild,
+				StorageMethod:  database.ProvisionerStorageMethodFile,
+				FileID:         uuid.New(),
+				Input:          json.RawMessage(`{}`),
+				Tags:           database.StringMap{},
+				TraceMetadata:  pqtype.NullRawMessage{},
+			})
+			require.NoError(t, err)
+			return job
+		}
+		acquire := func(keyID uuid.NullUUID) (database.ProvisionerJob, error) {
+			return db.AcquireProvisionerJob(ctx, database.AcquireProvisionerJobParams{
+				OrganizationID:   org.ID,
+				StartedAt:        sql.NullTime{Time: now, Valid: true},
+				WorkerID:         uuid.NullUUID{UUID: uuid.New(), Valid: true},
+				Types:            []database.ProvisionerType{database.ProvisionerTypeEcho},
+				ProvisionerTags:  json.RawMessage(`{}`),
+				ProvisionerKeyID: keyID,
+			})
+		}
+
+		// While the key exists, a keyed acquire claims the job.
+		job := insertPendingJob()
+		acquired, err := acquire(uuid.NullUUID{UUID: key.ID, Valid: true})
+		require.NoError(t, err)
+		require.Equal(t, job.ID, acquired.ID)
+
+		// Once the key is deleted, a keyed acquire claims nothing and the
+		// pending job is left untouched.
+		pending := insertPendingJob()
+		err = db.DeleteProvisionerKey(ctx, key.ID)
+		require.NoError(t, err)
+		_, err = acquire(uuid.NullUUID{UUID: key.ID, Valid: true})
+		require.ErrorIs(t, err, sql.ErrNoRows)
+
+		// The job remains claimable by a worker without a key constraint.
+		acquired, err = acquire(uuid.NullUUID{})
+		require.NoError(t, err)
+		require.Equal(t, pending.ID, acquired.ID)
+	})
 }
 
 func TestUserLastSeenFilter(t *testing.T) {

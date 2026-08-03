@@ -22327,15 +22327,29 @@ WHERE
 		SKIP LOCKED
 		LIMIT
 			1
+	)
+	-- When provisioner_key_id is set, the worker's key must still exist for the
+	-- claim to succeed. FOR KEY SHARE conflicts with DELETE on the key row, so a
+	-- claim that commits saw a live key and a committed deletion is seen by all
+	-- later claims. Reserved keys (built-in, user-auth, PSK) pass NULL and skip
+	-- the check, since they have no deletable row.
+	AND (
+		$6::uuid IS NULL
+		OR EXISTS (
+			SELECT 1 FROM provisioner_keys
+			WHERE provisioner_keys.id = $6::uuid
+			FOR KEY SHARE
+		)
 	) RETURNING id, created_at, updated_at, started_at, canceled_at, completed_at, error, organization_id, initiator_id, provisioner, storage_method, type, input, worker_id, file_id, tags, error_code, trace_metadata, job_status, logs_length, logs_overflowed
 `
 
 type AcquireProvisionerJobParams struct {
-	StartedAt       sql.NullTime      `db:"started_at" json:"started_at"`
-	WorkerID        uuid.NullUUID     `db:"worker_id" json:"worker_id"`
-	OrganizationID  uuid.UUID         `db:"organization_id" json:"organization_id"`
-	Types           []ProvisionerType `db:"types" json:"types"`
-	ProvisionerTags json.RawMessage   `db:"provisioner_tags" json:"provisioner_tags"`
+	StartedAt        sql.NullTime      `db:"started_at" json:"started_at"`
+	WorkerID         uuid.NullUUID     `db:"worker_id" json:"worker_id"`
+	OrganizationID   uuid.UUID         `db:"organization_id" json:"organization_id"`
+	Types            []ProvisionerType `db:"types" json:"types"`
+	ProvisionerTags  json.RawMessage   `db:"provisioner_tags" json:"provisioner_tags"`
+	ProvisionerKeyID uuid.NullUUID     `db:"provisioner_key_id" json:"provisioner_key_id"`
 }
 
 // Acquires the lock for a single job that isn't started, completed,
@@ -22351,6 +22365,7 @@ func (q *sqlQuerier) AcquireProvisionerJob(ctx context.Context, arg AcquireProvi
 		arg.OrganizationID,
 		pq.Array(arg.Types),
 		arg.ProvisionerTags,
+		arg.ProvisionerKeyID,
 	)
 	var i ProvisionerJob
 	err := row.Scan(

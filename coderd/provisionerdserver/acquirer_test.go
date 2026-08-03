@@ -504,7 +504,7 @@ func TestAcquirer_MatchTags(t *testing.T) {
 			if tt.unmatchedOrg {
 				acquireOrgID = uuid.New()
 			}
-			aj, err := acq.AcquireJob(ctx, acquireOrgID, uuid.New(), ptypes, tt.acquireJobTags)
+			aj, err := acq.AcquireJob(ctx, acquireOrgID, uuid.New(), ptypes, tt.acquireJobTags, uuid.NullUUID{})
 			if tt.expectAcquire {
 				assert.NoError(t, err)
 				assert.Equal(t, pj.ID, aj.ID)
@@ -703,7 +703,7 @@ func newTestAcquiree(t *testing.T, orgID uuid.UUID, workerID uuid.UUID, pt []dat
 
 func (a *testAcquiree) startAcquire(ctx context.Context, uut *provisionerdserver.Acquirer) {
 	go func() {
-		j, e := uut.AcquireJob(ctx, a.orgID, a.workerID, a.pt, a.tags)
+		j, e := uut.AcquireJob(ctx, a.orgID, a.workerID, a.pt, a.tags, uuid.NullUUID{})
 		a.ec <- e
 		a.jc <- j
 	}()

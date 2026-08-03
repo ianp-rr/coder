@@ -88,8 +88,10 @@ func NewAcquirer(ctx context.Context, logger slog.Logger, store AcquirerStore, p
 // tags from the database.  The call blocks until a job is acquired, the context is
 // done, or the database returns an error _other_ than that no jobs are available.
 // If no jobs are available, this method handles retrying as appropriate.
+// When keyID is valid, the claim only succeeds while that provisioner key row
+// still exists; pass an invalid NullUUID for daemons without a deletable key.
 func (a *Acquirer) AcquireJob(
-	ctx context.Context, organization uuid.UUID, worker uuid.UUID, pt []database.ProvisionerType, tags Tags,
+	ctx context.Context, organization uuid.UUID, worker uuid.UUID, pt []database.ProvisionerType, tags Tags, keyID uuid.NullUUID,
 ) (
 	retJob database.ProvisionerJob, retErr error,
 ) {
@@ -130,8 +132,9 @@ func (a *Acquirer) AcquireJob(
 					UUID:  worker,
 					Valid: true,
 				},
-				Types:           pt,
-				ProvisionerTags: dbTags,
+				Types:            pt,
+				ProvisionerTags:  dbTags,
+				ProvisionerKeyID: keyID,
 			})
 			if xerrors.Is(err, sql.ErrNoRows) {
 				logger.Debug(ctx, "no job available")

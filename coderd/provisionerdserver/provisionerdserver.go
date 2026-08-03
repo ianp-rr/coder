@@ -368,6 +368,13 @@ func (s *server) terminateOnDeletedKey() {
 	}
 }
 
+// acquireKeyID returns the provisioner key constraint for job acquisition: the
+// daemon's key ID when it is deletable, or an invalid NullUUID for reserved
+// keys, which have no row to check.
+func (s *server) acquireKeyID() uuid.NullUUID {
+	return uuid.NullUUID{UUID: s.KeyID, Valid: codersdk.IsDeletableProvisionerKey(s.KeyID)}
+}
+
 // AcquireJob queries the database to lock a job.
 //
 // Deprecated: This method is only available for back-level provisioner daemons.
@@ -387,7 +394,7 @@ func (s *server) AcquireJob(ctx context.Context, _ *proto.Empty) (*proto.Acquire
 	// database.
 	acqCtx, acqCancel := context.WithTimeout(ctx, s.acquireJobLongPollDur)
 	defer acqCancel()
-	job, err := s.Acquirer.AcquireJob(acqCtx, s.OrganizationID, s.ID, s.Provisioners, s.Tags)
+	job, err := s.Acquirer.AcquireJob(acqCtx, s.OrganizationID, s.ID, s.Provisioners, s.Tags, s.acquireKeyID())
 	if database.IsQueryCanceledError(err) {
 		s.Logger.Debug(ctx, "successful cancel")
 		return &proto.AcquiredJob{}, nil
@@ -432,7 +439,7 @@ func (s *server) AcquireJobWithCancel(stream proto.DRPCProvisionerDaemon_Acquire
 	}()
 	jec := make(chan jobAndErr, 1)
 	go func() {
-		job, err := s.Acquirer.AcquireJob(acqCtx, s.OrganizationID, s.ID, s.Provisioners, s.Tags)
+		job, err := s.Acquirer.AcquireJob(acqCtx, s.OrganizationID, s.ID, s.Provisioners, s.Tags, s.acquireKeyID())
 		jec <- jobAndErr{job: job, err: err}
 	}()
 	var recvErr error
