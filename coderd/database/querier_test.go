@@ -10663,7 +10663,7 @@ func TestUsageEventsTrigger(t *testing.T) {
 		require.Equal(t, "hb_ai_seats_v1", rows[0].EventType)
 		require.JSONEq(t, `{"count": 10}`, string(rows[0].UsageData))
 
-		// Insert a higher count on the same day — should take the max.
+		// Insert a higher count on the same day. It should take the max.
 		err = db.InsertUsageEvent(ctx, database.InsertUsageEventParams{
 			ID:        "hb-2",
 			EventType: "hb_ai_seats_v1",
@@ -10676,7 +10676,7 @@ func TestUsageEventsTrigger(t *testing.T) {
 		require.Len(t, rows, 1)
 		require.JSONEq(t, `{"count": 50}`, string(rows[0].UsageData))
 
-		// Insert a lower count on the same day — should keep the max (50).
+		// Insert a lower count on the same day. It should keep the max (50).
 		err = db.InsertUsageEvent(ctx, database.InsertUsageEventParams{
 			ID:        "hb-3",
 			EventType: "hb_ai_seats_v1",
@@ -10717,6 +10717,62 @@ func TestUsageEventsTrigger(t *testing.T) {
 		require.Len(t, rows, 3)
 	})
 
+	t.Run("HeartbeatAgentRuntime", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t, testutil.WaitLong)
+		db, _, sqlDB := dbtestutil.NewDBWithSQLDB(t)
+
+		insert := func(id, eventType, eventData string, createdAt time.Time) {
+			t.Helper()
+			err := db.InsertUsageEvent(ctx, database.InsertUsageEventParams{
+				ID:        id,
+				EventType: eventType,
+				EventData: []byte(eventData),
+				CreatedAt: createdAt,
+			})
+			require.NoError(t, err)
+		}
+		requireDaily := func(wantUsageData ...string) {
+			t.Helper()
+			rows := getDailyRows(ctx, sqlDB)
+			require.Len(t, rows, len(wantUsageData))
+			for i, want := range wantUsageData {
+				require.JSONEq(t, want, string(rows[i].UsageData))
+			}
+		}
+
+		day1 := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+		day2 := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+
+		insert("hb_agent_runtime_v1:2025-01-01_00:00:00", "hb_agent_runtime_v1", `{"runtime_ms": 1000}`, day1)
+		requireDaily(`{"runtime_ms": 1000}`)
+
+		// Unlike hb_ai_seats_v1, hourly runtime events are summed per day.
+		insert("hb_agent_runtime_v1:2025-01-01_12:00:00", "hb_agent_runtime_v1", `{"runtime_ms": 500}`, day1.Add(12*time.Hour))
+		requireDaily(`{"runtime_ms": 1500}`)
+
+		// Zero-valued events (idle hours) do not change the sum.
+		insert("hb_agent_runtime_v1:2025-01-01_18:00:00", "hb_agent_runtime_v1", `{"runtime_ms": 0}`, day1.Add(18*time.Hour))
+		requireDaily(`{"runtime_ms": 1500}`)
+
+		insert("hb_agent_runtime_v1:2025-01-02_00:00:00", "hb_agent_runtime_v1", `{"runtime_ms": 250}`, day2)
+		requireDaily(`{"runtime_ms": 1500}`, `{"runtime_ms": 250}`)
+
+		// Re-inserting a bucket must not double-count it. The daily rollup
+		// sums runtime_ms, so idempotency rests on the aggregate trigger
+		// being AFTER INSERT: Postgres does not fire it for rows suppressed
+		// by ON CONFLICT (id) DO NOTHING. Concurrent replicas and backfill
+		// re-runs both take this path.
+		insert("hb_agent_runtime_v1:2025-01-01_00:00:00", "hb_agent_runtime_v1", `{"runtime_ms": 1000}`, day1)
+		requireDaily(`{"runtime_ms": 1500}`, `{"runtime_ms": 250}`)
+
+		// A different event type on the same day gets its own daily row.
+		insert("hb-seats-1", "hb_ai_seats_v1", `{"count": 3}`, day2)
+		rows := getDailyRows(ctx, sqlDB)
+		require.Len(t, rows, 3)
+	})
+
 	t.Run("UnknownEventType", func(t *testing.T) {
 		t.Parallel()
 
@@ -10748,6 +10804,117 @@ func TestUsageEventsTrigger(t *testing.T) {
 		rows := getDailyRows(ctx, sqlDB)
 		require.Len(t, rows, 0)
 	})
+}
+
+func TestGetTotalChatMessageRuntimeMsInRange(t *testing.T) {
+	t.Parallel()
+
+	ctx := testutil.Context(t, testutil.WaitLong)
+	db, _, sqlDB := dbtestutil.NewDBWithSQLDB(t)
+
+	rangeStart := time.Date(2025, 3, 10, 10, 0, 0, 0, time.UTC)
+	rangeEnd := rangeStart.Add(time.Hour)
+
+	total, err := db.GetTotalChatMessageRuntimeMsInRange(ctx, database.GetTotalChatMessageRuntimeMsInRangeParams{
+		StartTime: rangeStart,
+		EndTime:   rangeEnd,
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 0, total)
+
+	user := dbgen.User(t, db, database.User{})
+	org := dbgen.Organization(t, db, database.Organization{})
+	_ = dbgen.OrganizationMember(t, db, database.OrganizationMember{UserID: user.ID, OrganizationID: org.ID})
+	_ = dbgen.ChatProvider(t, db, database.ChatProvider{
+		Provider:    "openai",
+		DisplayName: "OpenAI",
+	})
+	mc := dbgen.ChatModelConfig(t, db, database.ChatModelConfig{
+		Model:        "test-model",
+		ContextLimit: 8192,
+	})
+	chat1 := dbgen.Chat(t, db, database.Chat{
+		OrganizationID:    org.ID,
+		OwnerID:           user.ID,
+		LastModelConfigID: mc.ID,
+	})
+	chat2 := dbgen.Chat(t, db, database.Chat{
+		OrganizationID:    org.ID,
+		OwnerID:           user.ID,
+		LastModelConfigID: mc.ID,
+	})
+
+	insertMessage := func(chatID uuid.UUID, runtimeMs int64, createdAt time.Time, deleted bool) {
+		t.Helper()
+		msg := dbgen.ChatMessage(t, db, database.ChatMessage{
+			ChatID:        chatID,
+			CreatedBy:     uuid.NullUUID{UUID: user.ID, Valid: true},
+			ModelConfigID: uuid.NullUUID{UUID: mc.ID, Valid: true},
+			Role:          database.ChatMessageRoleAssistant,
+			RuntimeMs:     sql.NullInt64{Int64: runtimeMs, Valid: true},
+		})
+		_, err := sqlDB.ExecContext(ctx, "UPDATE chat_messages SET created_at = $1, deleted = $2 WHERE id = $3", createdAt, deleted, msg.ID)
+		require.NoError(t, err)
+	}
+
+	// Counted: on the inclusive start boundary, in the middle (across two
+	// chats), soft-deleted, and just before the exclusive end boundary.
+	insertMessage(chat1.ID, 1, rangeStart, false)
+	insertMessage(chat2.ID, 2, rangeStart.Add(30*time.Minute), false)
+	insertMessage(chat1.ID, 4, rangeStart.Add(45*time.Minute), true)
+	insertMessage(chat1.ID, 8, rangeEnd.Add(-time.Second), false)
+	// Not counted: before the range, on the exclusive end boundary, and a
+	// NULL runtime (runtime 0 is stored as NULL).
+	insertMessage(chat1.ID, 16, rangeStart.Add(-time.Second), false)
+	insertMessage(chat1.ID, 32, rangeEnd, false)
+	insertMessage(chat1.ID, 0, rangeStart.Add(10*time.Minute), false)
+
+	total, err = db.GetTotalChatMessageRuntimeMsInRange(ctx, database.GetTotalChatMessageRuntimeMsInRangeParams{
+		StartTime: rangeStart,
+		EndTime:   rangeEnd,
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 15, total)
+}
+
+func TestListUsageEventCreatedAtsByTypeSince(t *testing.T) {
+	t.Parallel()
+
+	ctx := testutil.Context(t, testutil.WaitLong)
+	db, _ := dbtestutil.NewDB(t)
+
+	since := time.Date(2025, 3, 10, 0, 0, 0, 0, time.UTC)
+
+	insertEvent := func(id, eventType string, eventData string, createdAt time.Time) {
+		t.Helper()
+		err := db.InsertUsageEvent(ctx, database.InsertUsageEventParams{
+			ID:        id,
+			EventType: eventType,
+			EventData: []byte(eventData),
+			CreatedAt: createdAt,
+		})
+		require.NoError(t, err)
+	}
+
+	// Matching type: one before since (excluded), one exactly at since
+	// (included), one after (included).
+	insertEvent("rt-old", "hb_agent_runtime_v1", `{"runtime_ms": 1}`, since.Add(-time.Hour))
+	insertEvent("rt-at", "hb_agent_runtime_v1", `{"runtime_ms": 2}`, since)
+	insertEvent("rt-new", "hb_agent_runtime_v1", `{"runtime_ms": 3}`, since.Add(time.Hour))
+	// Different type after since: excluded.
+	insertEvent("seats-new", "hb_ai_seats_v1", `{"count": 1}`, since.Add(time.Hour))
+
+	createdAts, err := db.ListUsageEventCreatedAtsByTypeSince(ctx, database.ListUsageEventCreatedAtsByTypeSinceParams{
+		EventType: "hb_agent_runtime_v1",
+		Since:     since,
+	})
+	require.NoError(t, err)
+	require.Len(t, createdAts, 2)
+	normalized := make([]time.Time, len(createdAts))
+	for i, ts := range createdAts {
+		normalized[i] = ts.UTC()
+	}
+	require.ElementsMatch(t, []time.Time{since, since.Add(time.Hour)}, normalized)
 }
 
 func TestListTasks(t *testing.T) {
@@ -12346,7 +12513,7 @@ func TestGetChatMessagesForPromptByChatID(t *testing.T) {
 
 	// This test exercises a complex CTE query for prompt
 	// reconstruction after compaction. It requires Postgres.
-	db, _ := dbtestutil.NewDB(t)
+	db, _, sqlDB := dbtestutil.NewDBWithSQLDB(t)
 	ctx := context.Background()
 
 	// Helper: create a chat model config (required FK for chats).
@@ -12426,13 +12593,48 @@ func TestGetChatMessagesForPromptByChatID(t *testing.T) {
 		return database.ChatMessage(results[0])
 	}
 
-	msgIDs := func(msgs []database.ChatMessage) []int64 {
-		ids := make([]int64, len(msgs))
-		for i, m := range msgs {
-			ids[i] = m.ID
-		}
-		return ids
+	invertCreatedAt := func(t *testing.T, chatID uuid.UUID) {
+		t.Helper()
+		_, err := sqlDB.ExecContext(ctx,
+			"UPDATE chat_messages SET created_at = now() - (id || ' seconds')::interval WHERE chat_id = $1",
+			chatID)
+		require.NoError(t, err)
 	}
+
+	t.Run("OrdersByIDWhenTimestampsDisagree", func(t *testing.T) {
+		t.Parallel()
+		chat := newChat(t)
+
+		sys := insertMsg(t, chat.ID, database.ChatMessageRoleSystem, database.ChatMessageVisibilityModel, false, "system prompt")
+		usr := insertMsg(t, chat.ID, database.ChatMessageRoleUser, database.ChatMessageVisibilityBoth, false, "question")
+		ast := insertMsg(t, chat.ID, database.ChatMessageRoleAssistant, database.ChatMessageVisibilityBoth, false, "tool call")
+		tool := insertMsg(t, chat.ID, database.ChatMessageRoleTool, database.ChatMessageVisibilityBoth, false, "tool result")
+		invertCreatedAt(t, chat.ID)
+
+		got, err := db.GetChatMessagesForPromptByChatID(ctx, chat.ID)
+		require.NoError(t, err)
+		require.Equal(t, []int64{sys.ID, usr.ID, ast.ID, tool.ID}, chatMessageIDs(got),
+			"the prompt must keep append order so a tool result follows its assistant call")
+	})
+
+	t.Run("CompactionBoundaryUsesID", func(t *testing.T) {
+		t.Parallel()
+		chat := newChat(t)
+
+		sys := insertMsg(t, chat.ID, database.ChatMessageRoleSystem, database.ChatMessageVisibilityModel, false, "system prompt")
+		insertMsg(t, chat.ID, database.ChatMessageRoleUser, database.ChatMessageVisibilityBoth, false, "before first summary")
+		staleSummary := insertMsg(t, chat.ID, database.ChatMessageRoleUser, database.ChatMessageVisibilityModel, true, "first summary")
+		insertMsg(t, chat.ID, database.ChatMessageRoleUser, database.ChatMessageVisibilityBoth, false, "between summaries")
+		latestSummary := insertMsg(t, chat.ID, database.ChatMessageRoleUser, database.ChatMessageVisibilityModel, true, "second summary")
+		afterLatest := insertMsg(t, chat.ID, database.ChatMessageRoleUser, database.ChatMessageVisibilityBoth, false, "after second summary")
+		invertCreatedAt(t, chat.ID)
+
+		got, err := db.GetChatMessagesForPromptByChatID(ctx, chat.ID)
+		require.NoError(t, err)
+		require.Equal(t, []int64{sys.ID, latestSummary.ID, afterLatest.ID}, chatMessageIDs(got),
+			"the boundary is compared with id, so it must also be selected by id")
+		require.NotContains(t, chatMessageIDs(got), staleSummary.ID)
+	})
 
 	t.Run("NoCompaction", func(t *testing.T) {
 		t.Parallel()
@@ -12444,7 +12646,7 @@ func TestGetChatMessagesForPromptByChatID(t *testing.T) {
 
 		got, err := db.GetChatMessagesForPromptByChatID(ctx, chat.ID)
 		require.NoError(t, err)
-		require.Equal(t, []int64{sys.ID, usr.ID, ast.ID}, msgIDs(got))
+		require.Equal(t, []int64{sys.ID, usr.ID, ast.ID}, chatMessageIDs(got))
 	})
 
 	t.Run("UserOnlyVisibilityExcluded", func(t *testing.T) {
@@ -12463,7 +12665,7 @@ func TestGetChatMessagesForPromptByChatID(t *testing.T) {
 			require.NotEqual(t, database.ChatMessageVisibilityUser, m.Visibility,
 				"visibility=user messages should not appear in the prompt")
 		}
-		require.Contains(t, msgIDs(got), usr.ID)
+		require.Contains(t, chatMessageIDs(got), usr.ID)
 	})
 
 	t.Run("AfterCompaction", func(t *testing.T) {
@@ -12490,7 +12692,7 @@ func TestGetChatMessagesForPromptByChatID(t *testing.T) {
 		got, err := db.GetChatMessagesForPromptByChatID(ctx, chat.ID)
 		require.NoError(t, err)
 
-		gotIDs := msgIDs(got)
+		gotIDs := chatMessageIDs(got)
 
 		// Must include: system prompt, summary, post-compaction.
 		require.Contains(t, gotIDs, sys.ID, "system prompt must be included")
@@ -12529,8 +12731,8 @@ func TestGetChatMessagesForPromptByChatID(t *testing.T) {
 		}
 		require.True(t, hasNonSystem,
 			"prompt must contain at least one non-system message after compaction")
-		require.Contains(t, msgIDs(got), summary.ID)
-		require.Contains(t, msgIDs(got), newUsr.ID)
+		require.Contains(t, chatMessageIDs(got), summary.ID)
+		require.Contains(t, chatMessageIDs(got), newUsr.ID)
 	})
 
 	t.Run("CompressedToolResultNotPickedAsSummary", func(t *testing.T) {
@@ -12549,7 +12751,7 @@ func TestGetChatMessagesForPromptByChatID(t *testing.T) {
 		got, err := db.GetChatMessagesForPromptByChatID(ctx, chat.ID)
 		require.NoError(t, err)
 
-		gotIDs := msgIDs(got)
+		gotIDs := chatMessageIDs(got)
 		require.Contains(t, gotIDs, summary.ID, "real summary must be included")
 		require.NotContains(t, gotIDs, compressedTool.ID,
 			"compressed tool result must not be included")

@@ -582,7 +582,7 @@ const docTemplate = `{
         },
         "/api/experimental/chats/{chat}/cost": {
             "get": {
-                "description": "Experimental: this endpoint is subject to change.",
+                "description": "Experimental: this endpoint is subject to change.\n\nCost covers the whole chat tree: the root chat plus every\nsubagent chat beneath it. Requesting cost for a subagent chat\nreturns that same total.\n\nCost is derived from AI Gateway data, which is subject to its\nown retention period, 60 days by default, configured\nindependently of chat retention. Spend for requests older than\nthat period is no longer reported, so a chat whose requests\nhave all been purged reports zero cost.",
                 "produces": [
                     "application/json"
                 ],
@@ -9950,7 +9950,7 @@ const docTemplate = `{
                 ]
             }
         },
-        "/api/v2/users/{user}/ai/budget": {
+        "/api/v2/users/{user}/ai/budget/override": {
             "get": {
                 "produces": [
                     "application/json"
@@ -15561,7 +15561,7 @@ const docTemplate = `{
                     }
                 },
                 "network_calls": {
-                    "description": "NetworkCalls summarizes the Agent Firewall network calls made during the\nsession. A nil value means the session did not pass through Agent\nFirewall, so network call monitoring was not active, which the UI\nsurfaces as \"Disabled\".",
+                    "description": "NetworkCalls summarizes the Agent Firewall network requests made during the\nsession. A nil value means the session did not pass through Agent\nFirewall, so network call monitoring was not active, which the UI\nsurfaces as \"Disabled\".",
                     "allOf": [
                         {
                             "$ref": "#/definitions/codersdk.AIBridgeSessionNetworkCallSummary"
@@ -15597,6 +15597,17 @@ const docTemplate = `{
                 }
             }
         },
+        "codersdk.AIBridgeSessionNetworkDomain": {
+            "type": "object",
+            "properties": {
+                "count": {
+                    "type": "integer"
+                },
+                "domain": {
+                    "type": "string"
+                }
+            }
+        },
         "codersdk.AIBridgeSessionThreadsResponse": {
             "type": "object",
             "properties": {
@@ -15621,6 +15632,31 @@ const docTemplate = `{
                     "type": "array",
                     "items": {
                         "type": "string"
+                    }
+                },
+                "network_call_logs": {
+                    "description": "NetworkCallLogs is the chronological list of individual network calls made\nduring the session, holding the earliest calls up to a server-side cap.\nNetworkCalls remains authoritative for whole-session totals, so a shorter\nlist than NetworkCalls.Total means the list was truncated. Empty when the\nsession did not pass through Agent Firewall.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/codersdk.AgentFirewallLog"
+                    }
+                },
+                "network_calls": {
+                    "description": "NetworkCalls summarizes the Agent Firewall network calls made during the\nsession. A nil value means the session did not pass through Agent\nFirewall, so network call monitoring was not active, which the UI\nsurfaces as \"Disabled\".",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/codersdk.AIBridgeSessionNetworkCallSummary"
+                        }
+                    ]
+                },
+                "network_domain_count": {
+                    "type": "integer"
+                },
+                "network_top_domains": {
+                    "description": "NetworkTopDomains lists the most contacted destination hosts, ordered by\ncall count descending. NetworkDomainCount is the total number of distinct\ndomains, used to render a \"+N more\" overflow beyond the listed domains.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/codersdk.AIBridgeSessionNetworkDomain"
                     }
                 },
                 "page_ended_at": {
@@ -15784,6 +15820,17 @@ const docTemplate = `{
                 }
             }
         },
+        "codersdk.AIBudgetLimit": {
+            "type": "object",
+            "properties": {
+                "limit_source": {
+                    "$ref": "#/definitions/codersdk.AIBudgetLimitSource"
+                },
+                "spend_limit_micros": {
+                    "type": "integer"
+                }
+            }
+        },
         "codersdk.AIBudgetLimitSource": {
             "type": "string",
             "enum": [
@@ -15829,17 +15876,6 @@ const docTemplate = `{
                 },
                 "name": {
                     "type": "string"
-                }
-            }
-        },
-        "codersdk.AIGroupBudget": {
-            "type": "object",
-            "properties": {
-                "limit_source": {
-                    "$ref": "#/definitions/codersdk.AIBudgetLimitSource"
-                },
-                "spend_limit_micros": {
-                    "type": "integer"
                 }
             }
         },
@@ -17370,6 +17406,18 @@ const docTemplate = `{
                 },
                 "debug_logging_enabled": {
                     "type": "boolean"
+                },
+                "hook_enabled": {
+                    "type": "boolean"
+                },
+                "hook_secret": {
+                    "type": "string"
+                },
+                "hook_timeout": {
+                    "type": "integer"
+                },
+                "hook_url": {
+                    "$ref": "#/definitions/serpent.URL"
                 }
             }
         },
@@ -17492,13 +17540,13 @@ const docTemplate = `{
                     "type": "string",
                     "format": "uuid"
                 },
-                "priced_message_count": {
+                "request_count": {
                     "type": "integer"
                 },
                 "total_cost_micros": {
                     "type": "integer"
                 },
-                "unpriced_messages_having_usage_count": {
+                "unpriced_request_count": {
                     "type": "integer"
                 }
             }
@@ -17638,7 +17686,9 @@ const docTemplate = `{
                 "usage_limit",
                 "missing_key",
                 "provider_disabled",
-                "content_filter"
+                "content_filter",
+                "hook_dispatch_failed",
+                "hook_denied"
             ],
             "x-enum-varnames": [
                 "ChatErrorKindGeneric",
@@ -17651,7 +17701,9 @@ const docTemplate = `{
                 "ChatErrorKindUsageLimit",
                 "ChatErrorKindMissingKey",
                 "ChatErrorKindProviderDisabled",
-                "ChatErrorKindContentFilter"
+                "ChatErrorKindContentFilter",
+                "ChatErrorKindHookDispatchFailed",
+                "ChatErrorKindHookDenied"
             ]
         },
         "codersdk.ChatFileMetadata": {
@@ -17995,7 +18047,9 @@ const docTemplate = `{
                 "file",
                 "file-reference",
                 "context-file",
-                "skill"
+                "skill",
+                "hook-context",
+                "hook-notice"
             ],
             "x-enum-varnames": [
                 "ChatMessagePartTypeText",
@@ -18006,7 +18060,9 @@ const docTemplate = `{
                 "ChatMessagePartTypeFile",
                 "ChatMessagePartTypeFileReference",
                 "ChatMessagePartTypeContextFile",
-                "ChatMessagePartTypeSkill"
+                "ChatMessagePartTypeSkill",
+                "ChatMessagePartTypeHookContext",
+                "ChatMessagePartTypeHookNotice"
             ]
         },
         "codersdk.ChatMessageRole": {
@@ -18763,6 +18819,13 @@ const docTemplate = `{
             "properties": {
                 "message": {
                     "$ref": "#/definitions/codersdk.ChatMessage"
+                },
+                "messages": {
+                    "description": "Messages contains all user-visible messages inserted by the send, in\ninsertion order. A queued send on an errored chat may promote the\nprevious queue head, so clients must upsert the full batch.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/codersdk.ChatMessage"
+                    }
                 },
                 "queued": {
                     "type": "boolean"
@@ -20200,8 +20263,22 @@ const docTemplate = `{
         "codersdk.EditChatMessageResponse": {
             "type": "object",
             "properties": {
+                "deleted_message_ids": {
+                    "description": "DeletedMessageIDs holds the IDs of previously visible messages the\nedit removed, including stale hook notices from the edited turn.\nClients should drop them from local caches.",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
                 "message": {
                     "$ref": "#/definitions/codersdk.ChatMessage"
+                },
+                "messages": {
+                    "description": "Messages holds every user-visible message inserted by the edit, in\ninsertion order. Hook-generated suffix messages may follow Message,\nso clients must upsert the full batch.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/codersdk.ChatMessage"
+                    }
                 },
                 "warnings": {
                     "type": "array",
@@ -20274,13 +20351,13 @@ const docTemplate = `{
                 "minimum-implicit-member",
                 "workspace-capable-licensing",
                 "ai-gateway-seat-exclusion",
-                "ai-gateway-cost-control",
                 "chat-advisor",
-                "chat-virtual-desktop"
+                "chat-virtual-desktop",
+                "agent-lifecycle-hooks"
             ],
             "x-enum-comments": {
-                "ExperimentAIGatewayCostControl": "Enables AI Gateway cost control functionality.",
                 "ExperimentAIGatewaySeatExclusion": "Excludes AI Gateway (AI Bridge) usage from AI Governance seat consumption.",
+                "ExperimentAgentLifecycleHooks": "Enables chat lifecycle hook webhooks for agent chats.",
                 "ExperimentAutoFillParameters": "This should not be taken out of experiments until we have redesigned the feature.",
                 "ExperimentChatAdvisor": "Enables the advisor tool for root agent chats.",
                 "ExperimentChatVirtualDesktop": "Enables virtual desktop and computer use provider for agents.",
@@ -20306,9 +20383,9 @@ const docTemplate = `{
                 "Allows organizations to deviate from the default organization-member roles, in support of Gateway Accounts.",
                 "Counts only users holding the workspace-create permission toward the license seat limit.",
                 "Excludes AI Gateway (AI Bridge) usage from AI Governance seat consumption.",
-                "Enables AI Gateway cost control functionality.",
                 "Enables the advisor tool for root agent chats.",
-                "Enables virtual desktop and computer use provider for agents."
+                "Enables virtual desktop and computer use provider for agents.",
+                "Enables chat lifecycle hook webhooks for agent chats."
             ],
             "x-enum-varnames": [
                 "ExperimentExample",
@@ -20322,9 +20399,9 @@ const docTemplate = `{
                 "ExperimentMinimumImplicitMember",
                 "ExperimentWorkspaceCapableLicensing",
                 "ExperimentAIGatewaySeatExclusion",
-                "ExperimentAIGatewayCostControl",
                 "ExperimentChatAdvisor",
-                "ExperimentChatVirtualDesktop"
+                "ExperimentChatVirtualDesktop",
+                "ExperimentAgentLifecycleHooks"
             ]
         },
         "codersdk.ExternalAPIKeyScopes": {
@@ -20793,7 +20870,7 @@ const docTemplate = `{
                     "description": "GroupBudget is the budget when the queried group is this user's\neffective budget source. Null when the user's budget resolves to another\ngroup or no budget applies to the user.",
                     "allOf": [
                         {
-                            "$ref": "#/definitions/codersdk.AIGroupBudget"
+                            "$ref": "#/definitions/codersdk.AIBudgetLimit"
                         }
                     ]
                 },
@@ -26275,6 +26352,7 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "spend_limit_micros": {
+                    "description": "SpendLimitMicros must not exceed MaxAISpendLimitMicros.",
                     "type": "integer",
                     "minimum": 0
                 }
@@ -26292,6 +26370,7 @@ const docTemplate = `{
                     "format": "uuid"
                 },
                 "spend_limit_micros": {
+                    "description": "SpendLimitMicros must not exceed MaxAISpendLimitMicros.",
                     "type": "integer",
                     "minimum": 0
                 }
@@ -26482,18 +26561,18 @@ const docTemplate = `{
                     "description": "CurrentSpendMicros is the user's spend on their effective group over\nthe current budget period.",
                     "type": "integer"
                 },
+                "effective_budget": {
+                    "description": "EffectiveBudget is the spend limit that applies to the user, whether it\ncame from a group budget or a user override. Null when no budget\napplies, leaving the user's spend unlimited.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/codersdk.AIBudgetLimit"
+                        }
+                    ]
+                },
                 "effective_group_id": {
                     "description": "EffectiveGroupID is the group the spend is attributed to, falling back to\nthe Everyone group when no budget applies. Null only when the user has no\norganization membership.",
                     "type": "string",
                     "format": "uuid"
-                },
-                "limit_source": {
-                    "description": "LimitSource identifies which tier produced the limit. Null when no\nbudget applies.",
-                    "allOf": [
-                        {
-                            "$ref": "#/definitions/codersdk.AIBudgetLimitSource"
-                        }
-                    ]
                 },
                 "period_end": {
                     "description": "PeriodEnd is the exclusive upper bound of the current budget\nperiod.",
@@ -26504,10 +26583,6 @@ const docTemplate = `{
                     "description": "PeriodStart is the inclusive lower bound of the current budget\nperiod.",
                     "type": "string",
                     "format": "date-time"
-                },
-                "spend_limit_micros": {
-                    "description": "SpendLimitMicros is the effective spend limit in micro-units.\nNull when no budget applies to the user (unlimited).",
-                    "type": "integer"
                 },
                 "user_id": {
                     "type": "string",
