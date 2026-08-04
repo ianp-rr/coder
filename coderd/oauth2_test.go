@@ -611,6 +611,76 @@ func TestOAuth2ProviderTokenExchangeCodeBelongsToDifferentApp(t *testing.T) {
 	require.ErrorContains(t, err, "The authorization code is invalid or expired")
 }
 
+// TestOAuth2ProviderTokenExchangePublicClientCodeBelongsToDifferentApp is the
+// public-client counterpart to the test above. A public client presents no
+// secret, so the secret-ownership check never runs and the code-ownership
+// check is the only thing binding the exchange to the app identified by
+// client_id. Two public clients sharing a redirect URI is the common case for
+// native apps, which makes this the scenario the check has to hold in.
+func TestOAuth2ProviderTokenExchangePublicClientCodeBelongsToDifferentApp(t *testing.T) {
+	t.Parallel()
+
+	ownerClient := coderdtest.New(t, nil)
+	owner := coderdtest.CreateFirstUser(t, ownerClient)
+	oauth2providertest.EnableDCR(t, ownerClient)
+	ctx := testutil.Context(t, testutil.WaitLong)
+
+	const sharedCallback = "http://localhost:8080/callback"
+	registerPublicClient := func(name string) codersdk.OAuth2ClientRegistrationResponse {
+		resp, err := ownerClient.PostOAuth2ClientRegistration(ctx, codersdk.OAuth2ClientRegistrationRequest{
+			RedirectURIs:            []string{sharedCallback},
+			ClientName:              fmt.Sprintf("%s-%d", name, time.Now().UnixNano()),
+			TokenEndpointAuthMethod: codersdk.OAuth2TokenEndpointAuthMethodNone,
+		})
+		require.NoError(t, err)
+		// A public client is issued no secret, which is what makes the
+		// code-ownership check the sole app binding below.
+		require.Empty(t, resp.ClientSecret)
+		return resp
+	}
+	appA := registerPublicClient("public-code-owner")
+	appB := registerPublicClient("public-code-thief")
+
+	userClient, _ := coderdtest.CreateAnotherUser(t, ownerClient, owner.OrganizationID)
+
+	authURL := ownerClient.URL.JoinPath("/oauth2/authorize").String()
+	tokenURL := ownerClient.URL.JoinPath("/oauth2/tokens").String()
+
+	cfgA := &oauth2.Config{
+		ClientID: appA.ClientID,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:   authURL,
+			TokenURL:  tokenURL,
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
+		RedirectURL: sharedCallback,
+		Scopes:      []string{},
+	}
+	code, verifier, err := authorizationFlow(ctx, userClient, cfgA)
+	require.NoError(t, err)
+
+	// Redeem appA's code under appB's client_id, with no secret and a valid
+	// PKCE verifier. Everything except the code's own app_id lines up.
+	cfgB := &oauth2.Config{
+		ClientID: appB.ClientID,
+		Endpoint: oauth2.Endpoint{
+			TokenURL:  tokenURL,
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
+		RedirectURL: sharedCallback,
+		Scopes:      []string{},
+	}
+	_, err = cfgB.Exchange(ctx, code, oauth2.SetAuthURLParam("code_verifier", verifier))
+	require.Error(t, err)
+	require.ErrorContains(t, err, "The authorization code is invalid or expired")
+
+	// The rejection must not have consumed the code: appA can still redeem
+	// its own code afterwards.
+	token, err := cfgA.Exchange(ctx, code, oauth2.SetAuthURLParam("code_verifier", verifier))
+	require.NoError(t, err)
+	require.NotEmpty(t, token.AccessToken)
+}
+
 func TestOAuth2ProviderTokenRefresh(t *testing.T) {
 	t.Parallel()
 	ctx := testutil.Context(t, testutil.WaitLong)

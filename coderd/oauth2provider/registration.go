@@ -72,13 +72,22 @@ func CreateDynamicClientRegistration(db database.Store, accessURL *url.URL, audi
 		// Apply defaults
 		req = req.ApplyDefaults()
 
-		// Generate client credentials
+		clientType := req.DetermineClientType()
+		isPublic := clientType == "public"
+
+		// Generate client credentials. Public clients authenticate with PKCE
+		// alone and never receive a secret (RFC 7591 §2, OAuth 2.1 §2.1).
 		clientID := uuid.New()
-		clientSecret, hashedSecret, err := generateClientCredentials()
-		if err != nil {
-			writeOAuth2RegistrationError(ctx, rw, http.StatusInternalServerError,
-				"server_error", "Failed to generate client credentials")
-			return
+		var clientSecret string
+		var hashedSecret []byte
+		if !isPublic {
+			var err error
+			clientSecret, hashedSecret, err = generateClientCredentials()
+			if err != nil {
+				writeOAuth2RegistrationError(ctx, rw, http.StatusInternalServerError,
+					"server_error", "Failed to generate client credentials")
+				return
+			}
 		}
 
 		// Generate registration access token for RFC 7592 management
@@ -92,35 +101,69 @@ func CreateDynamicClientRegistration(db database.Store, accessURL *url.URL, audi
 		// Store in database - use system context since this is a public endpoint
 		now := dbtime.Now()
 		clientName := req.GenerateClientName()
-		//nolint:gocritic // OAuth2 system context — dynamic registration is a public endpoint
-		app, err := db.InsertOAuth2ProviderApp(dbauthz.AsSystemOAuth2(ctx), database.InsertOAuth2ProviderAppParams{
-			ID:                      clientID,
-			CreatedAt:               now,
-			UpdatedAt:               now,
-			Name:                    clientName,
-			Icon:                    req.LogoURI,
-			CallbackURL:             req.RedirectURIs[0], // Primary redirect URI
-			RedirectUris:            req.RedirectURIs,
-			ClientType:              sql.NullString{String: req.DetermineClientType(), Valid: true},
-			DynamicallyRegistered:   sql.NullBool{Bool: true, Valid: true},
-			ClientIDIssuedAt:        sql.NullTime{Time: now, Valid: true},
-			ClientSecretExpiresAt:   sql.NullTime{}, // No expiration for now
-			GrantTypes:              slice.ToStrings(req.GrantTypes),
-			ResponseTypes:           slice.ToStrings(req.ResponseTypes),
-			TokenEndpointAuthMethod: sql.NullString{String: string(req.TokenEndpointAuthMethod), Valid: true},
-			Scope:                   sql.NullString{String: req.Scope, Valid: true},
-			Contacts:                req.Contacts,
-			ClientUri:               sql.NullString{String: req.ClientURI, Valid: req.ClientURI != ""},
-			LogoUri:                 sql.NullString{String: req.LogoURI, Valid: req.LogoURI != ""},
-			TosUri:                  sql.NullString{String: req.TOSURI, Valid: req.TOSURI != ""},
-			PolicyUri:               sql.NullString{String: req.PolicyURI, Valid: req.PolicyURI != ""},
-			JwksUri:                 sql.NullString{String: req.JWKSURI, Valid: req.JWKSURI != ""},
-			Jwks:                    pqtype.NullRawMessage{RawMessage: req.JWKS, Valid: len(req.JWKS) > 0},
-			SoftwareID:              sql.NullString{String: req.SoftwareID, Valid: req.SoftwareID != ""},
-			SoftwareVersion:         sql.NullString{String: req.SoftwareVersion, Valid: req.SoftwareVersion != ""},
-			RegistrationAccessToken: hashedRegToken,
-			RegistrationClientUri:   sql.NullString{String: fmt.Sprintf("%s/oauth2/clients/%s", accessURL.String(), clientID), Valid: true},
-		})
+		// The app and its secret are written in one transaction. A partial
+		// write would commit an app that can never authenticate, and which
+		// still holds a registration access token.
+		var app database.OAuth2ProviderApp
+		err = db.InTx(func(tx database.Store) error {
+			var err error
+			//nolint:gocritic // OAuth2 system context, dynamic registration is a public endpoint
+			app, err = tx.InsertOAuth2ProviderApp(dbauthz.AsSystemOAuth2(ctx), database.InsertOAuth2ProviderAppParams{
+				ID:                      clientID,
+				CreatedAt:               now,
+				UpdatedAt:               now,
+				Name:                    clientName,
+				Icon:                    req.LogoURI,
+				CallbackURL:             req.RedirectURIs[0], // Primary redirect URI
+				RedirectUris:            req.RedirectURIs,
+				ClientType:              sql.NullString{String: clientType, Valid: true},
+				DynamicallyRegistered:   sql.NullBool{Bool: true, Valid: true},
+				ClientIDIssuedAt:        sql.NullTime{Time: now, Valid: true},
+				ClientSecretExpiresAt:   sql.NullTime{}, // No expiration for now
+				GrantTypes:              slice.ToStrings(req.GrantTypes),
+				ResponseTypes:           slice.ToStrings(req.ResponseTypes),
+				TokenEndpointAuthMethod: sql.NullString{String: string(req.TokenEndpointAuthMethod), Valid: true},
+				Scope:                   sql.NullString{String: req.Scope, Valid: true},
+				Contacts:                req.Contacts,
+				ClientUri:               sql.NullString{String: req.ClientURI, Valid: req.ClientURI != ""},
+				LogoUri:                 sql.NullString{String: req.LogoURI, Valid: req.LogoURI != ""},
+				TosUri:                  sql.NullString{String: req.TOSURI, Valid: req.TOSURI != ""},
+				PolicyUri:               sql.NullString{String: req.PolicyURI, Valid: req.PolicyURI != ""},
+				JwksUri:                 sql.NullString{String: req.JWKSURI, Valid: req.JWKSURI != ""},
+				Jwks:                    pqtype.NullRawMessage{RawMessage: req.JWKS, Valid: len(req.JWKS) > 0},
+				SoftwareID:              sql.NullString{String: req.SoftwareID, Valid: req.SoftwareID != ""},
+				SoftwareVersion:         sql.NullString{String: req.SoftwareVersion, Valid: req.SoftwareVersion != ""},
+				RegistrationAccessToken: hashedRegToken,
+				RegistrationClientUri:   sql.NullString{String: fmt.Sprintf("%s/oauth2/clients/%s", accessURL.String(), clientID), Valid: true},
+			})
+			if err != nil {
+				return xerrors.Errorf("insert oauth2 provider app: %w", err)
+			}
+
+			if isPublic {
+				return nil
+			}
+
+			// Create client secret - parse the formatted secret to get components
+			parsedSecret, err := ParseFormattedSecret(clientSecret)
+			if err != nil {
+				return xerrors.Errorf("parse generated secret: %w", err)
+			}
+
+			//nolint:gocritic // OAuth2 system context, dynamic registration is a public endpoint
+			_, err = tx.InsertOAuth2ProviderAppSecret(dbauthz.AsSystemOAuth2(ctx), database.InsertOAuth2ProviderAppSecretParams{
+				ID:            uuid.New(),
+				CreatedAt:     now,
+				SecretPrefix:  []byte(parsedSecret.Prefix),
+				HashedSecret:  hashedSecret,
+				DisplaySecret: createDisplaySecret(clientSecret),
+				AppID:         clientID,
+			})
+			if err != nil {
+				return xerrors.Errorf("insert oauth2 provider app secret: %w", err)
+			}
+			return nil
+		}, nil)
 		if err != nil {
 			logger.Error(ctx, "failed to store oauth2 client registration",
 				slog.Error(err),
@@ -129,29 +172,6 @@ func CreateDynamicClientRegistration(db database.Store, accessURL *url.URL, audi
 				slog.F("redirect_uris", req.RedirectURIs))
 			writeOAuth2RegistrationError(ctx, rw, http.StatusInternalServerError,
 				"server_error", "Failed to store client registration")
-			return
-		}
-
-		// Create client secret - parse the formatted secret to get components
-		parsedSecret, err := ParseFormattedSecret(clientSecret)
-		if err != nil {
-			writeOAuth2RegistrationError(ctx, rw, http.StatusInternalServerError,
-				"server_error", "Failed to parse generated secret")
-			return
-		}
-
-		//nolint:gocritic // OAuth2 system context — dynamic registration is a public endpoint
-		_, err = db.InsertOAuth2ProviderAppSecret(dbauthz.AsSystemOAuth2(ctx), database.InsertOAuth2ProviderAppSecretParams{
-			ID:            uuid.New(),
-			CreatedAt:     now,
-			SecretPrefix:  []byte(parsedSecret.Prefix),
-			HashedSecret:  hashedSecret,
-			DisplaySecret: createDisplaySecret(clientSecret),
-			AppID:         clientID,
-		})
-		if err != nil {
-			writeOAuth2RegistrationError(ctx, rw, http.StatusInternalServerError,
-				"server_error", "Failed to store client secret")
 			return
 		}
 
@@ -311,6 +331,21 @@ func UpdateClientConfiguration(db database.Store, auditor *audit.Auditor, logger
 			return
 		}
 
+		// A client's type is fixed at registration (RFC 7592 §2.2 permits
+		// rejecting metadata the server will not accept). Flipping it would
+		// either drop the secret requirement for a client that has one, or
+		// mark a client confidential when it has no secret and no way to be
+		// issued one. Comparing the derived client type rather than the raw
+		// auth method keeps client_secret_basic and client_secret_post
+		// interchangeable, since both are confidential.
+		clientType := req.DetermineClientType()
+		if clientType != existingApp.ClientType.String {
+			writeOAuth2RegistrationError(ctx, rw, http.StatusBadRequest,
+				"invalid_client_metadata",
+				"token_endpoint_auth_method cannot change an existing client between public and confidential")
+			return
+		}
+
 		// Update app in database
 		now := dbtime.Now()
 		//nolint:gocritic // OAuth2 system context — RFC 7592 client configuration endpoint
@@ -321,7 +356,7 @@ func UpdateClientConfiguration(db database.Store, auditor *audit.Auditor, logger
 			Icon:                    req.LogoURI,
 			CallbackURL:             req.RedirectURIs[0], // Primary redirect URI
 			RedirectUris:            req.RedirectURIs,
-			ClientType:              sql.NullString{String: req.DetermineClientType(), Valid: true},
+			ClientType:              sql.NullString{String: clientType, Valid: true},
 			ClientSecretExpiresAt:   sql.NullTime{}, // No expiration for now
 			GrantTypes:              slice.ToStrings(req.GrantTypes),
 			ResponseTypes:           slice.ToStrings(req.ResponseTypes),
