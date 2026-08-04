@@ -382,6 +382,36 @@ func TestHeartbeat(t *testing.T) {
 	// goleak.VerifyTestMain ensures that the heartbeat goroutine does not leak
 }
 
+// TestHeartbeat_ProvisionerKeyDeleted verifies that the heartbeat loop cancels
+// the session once the daemon's deletable key no longer exists.
+func TestHeartbeat_ProvisionerKeyDeleted(t *testing.T) {
+	t.Parallel()
+	ctx := testutil.Context(t, testutil.WaitShort)
+
+	keyID := uuid.New()
+	sessionCanceled := make(chan struct{})
+	//nolint:dogsled
+	_, db, _, _ := setup(t, false, &overrides{
+		keyID:             keyID,
+		heartbeatInterval: testutil.IntervalFast,
+		sessionCancel:     sync.OnceFunc(func() { close(sessionCanceled) }),
+	})
+
+	// While the key exists, heartbeats must not cancel the session.
+	select {
+	case <-sessionCanceled:
+		t.Fatal("session canceled while key exists")
+	default:
+	}
+
+	err := db.DeleteProvisionerKey(dbauthz.AsProvisionerd(ctx), keyID)
+	require.NoError(t, err)
+
+	// A subsequent heartbeat tick must observe the deletion and cancel the
+	// session.
+	testutil.TryReceive(ctx, t, sessionCanceled)
+}
+
 func TestAcquireJob(t *testing.T) {
 	t.Parallel()
 

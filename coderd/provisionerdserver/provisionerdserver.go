@@ -312,6 +312,16 @@ func (s *server) heartbeatLoop() {
 			if err := s.heartbeat(hbCtx); err != nil && !database.IsQueryCanceledError(err) {
 				s.Logger.Warn(hbCtx, "heartbeat failed", slog.Error(err))
 			}
+			// The key check rides the heartbeat tick so a session whose deletable
+			// key is gone terminates within one interval. Transient errors are
+			// logged and the session is left running.
+			if deleted, err := s.keyDeleted(hbCtx); err != nil && !database.IsQueryCanceledError(err) {
+				s.Logger.Warn(hbCtx, "check provisioner key on heartbeat", slog.Error(err))
+			} else if deleted {
+				s.Logger.Warn(hbCtx, "provisioner key deleted, canceling session",
+					slog.F("provisioner_key_id", s.KeyID))
+				s.terminateOnDeletedKey()
+			}
 			hbCancel()
 			elapsed := s.timeNow().Sub(start)
 			nextBeat := s.heartbeatInterval - elapsed
@@ -349,7 +359,9 @@ func (s *server) keyDeleted(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	_, err := s.Database.GetProvisionerKeyByID(
-		//nolint:gocritic // ctx is authorized as provisionerd, which cannot read provisioner keys.
+		//nolint:gocritic // Callers' contexts cannot read provisioner keys
+		// (provisionerd actor or no actor at all), so scope the read to this
+		// narrow subject.
 		dbauthz.AsSystemReadProvisionerDaemons(ctx), s.KeyID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return true, nil
