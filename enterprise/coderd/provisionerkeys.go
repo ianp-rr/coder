@@ -198,9 +198,7 @@ func (api *API) deleteProvisionerKey(rw http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	provisionerKey := httpmw.ProvisionerKeyParam(r)
 
-	if provisionerKey.ID.String() == codersdk.ProvisionerKeyIDBuiltIn ||
-		provisionerKey.ID.String() == codersdk.ProvisionerKeyIDUserAuth ||
-		provisionerKey.ID.String() == codersdk.ProvisionerKeyIDPSK {
+	if codersdk.IsReservedProvisionerKey(provisionerKey.ID) {
 		httpapi.Write(ctx, rw, http.StatusBadRequest, codersdk.Response{
 			Message: fmt.Sprintf("Cannot delete reserved '%s' provisioner key", provisionerKey.Name),
 		})
