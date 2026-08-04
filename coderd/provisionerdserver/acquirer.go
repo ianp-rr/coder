@@ -15,6 +15,7 @@ import (
 
 	"cdr.dev/slog/v3"
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/coderd/database/provisionerjobs"
 	"github.com/coder/coder/v2/coderd/database/pubsub"
@@ -64,6 +65,7 @@ func TestingBackupPollDuration(dur time.Duration) AcquirerOption {
 // AcquirerStore is the subset of database.Store that the Acquirer needs
 type AcquirerStore interface {
 	AcquireProvisionerJob(context.Context, database.AcquireProvisionerJobParams) (database.ProvisionerJob, error)
+	GetProvisionerKeyByID(context.Context, uuid.UUID) (database.ProvisionerKey, error)
 }
 
 func NewAcquirer(ctx context.Context, logger slog.Logger, store AcquirerStore, ps pubsub.Pubsub,
@@ -137,6 +139,29 @@ func (a *Acquirer) AcquireJob(
 				ProvisionerKeyID: keyID,
 			})
 			if xerrors.Is(err, sql.ErrNoRows) {
+				// The claim query returns no rows both when no job is pending and
+				// when the worker's deletable key was deleted (deleted keys cannot
+				// lock jobs). Disambiguate so a dead-key acquiree exits instead of
+				// re-parking and consuming wakeups its peers could have used.
+				if keyID.Valid {
+					_, kerr := a.store.GetProvisionerKeyByID(
+						//nolint:gocritic // The acquire context has no actor that can
+						// read provisioner keys, so scope the read to this narrow subject.
+						dbauthz.AsSystemReadProvisionerDaemons(ctx), keyID.UUID)
+					if xerrors.Is(kerr, sql.ErrNoRows) {
+						logger.Debug(ctx, "provisioner key deleted, exiting acquire")
+						// cancel (not done) hands an in-progress clearance to another
+						// acquiree in the domain, re-dispatching the wakeup this
+						// acquiree consumed.
+						if internalError := a.cancel(dk, clearance); internalError != nil {
+							return database.ProvisionerJob{}, internalError
+						}
+						return database.ProvisionerJob{}, ErrProvisionerKeyDeleted
+					}
+					if kerr != nil {
+						logger.Warn(ctx, "failed to check provisioner key after empty acquire", slog.Error(kerr))
+					}
+				}
 				logger.Debug(ctx, "no job available")
 				continue
 			}

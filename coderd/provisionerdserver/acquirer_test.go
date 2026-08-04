@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -110,6 +111,55 @@ func TestAcquirer_MultipleSameDomain(t *testing.T) {
 		gotWorkerCalls[params.WorkerID.UUID] = true
 	}
 	require.Equal(t, workerIDs, gotWorkerCalls)
+}
+
+// TestAcquirer_ProvisionerKeyDeleted verifies that an acquiree whose deletable
+// key no longer exists exits with ErrProvisionerKeyDeleted and hands its
+// clearance to another acquiree in the same domain.
+func TestAcquirer_ProvisionerKeyDeleted(t *testing.T) {
+	t.Parallel()
+	fs := newFakeOrderedStore()
+	ps := pubsub.NewInMemory()
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
+	defer cancel()
+	logger := testutil.Logger(t)
+	uut := provisionerdserver.NewAcquirer(ctx, logger.Named("acquirer"), fs, ps)
+
+	orgID := uuid.New()
+	pt := []database.ProvisionerType{database.ProvisionerTypeEcho}
+	tags := provisionerdserver.Tags{"environment": "on-prem"}
+
+	// The keyed acquiree starts first; as the domain's first member it gets
+	// immediate clearance and blocks in the store call.
+	keyed := newTestAcquiree(t, orgID, uuid.New(), pt, tags)
+	keyed.startAcquireWithKey(ctx, uut, uuid.NullUUID{UUID: uuid.New(), Valid: true})
+	require.Eventually(t, func() bool { return fs.callCount() == 1 }, testutil.WaitShort, testutil.IntervalFast)
+
+	// The unkeyed acquiree joins the same domain and parks without clearance.
+	unkeyed := newTestAcquiree(t, orgID, uuid.New(), pt, tags)
+	unkeyed.startAcquire(ctx, uut)
+
+	// Delete the key, then release the keyed acquiree's claim with no rows.
+	fs.keyDeleted.Store(true)
+	err := fs.sendCtx(ctx, database.ProvisionerJob{}, sql.ErrNoRows)
+	require.NoError(t, err)
+
+	// The keyed acquiree exits terminally rather than re-parking.
+	select {
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for keyed acquiree to exit")
+	case err := <-keyed.ec:
+		require.ErrorIs(t, err, provisionerdserver.ErrProvisionerKeyDeleted)
+	}
+	<-keyed.jc
+
+	// Its clearance is handed to the unkeyed acquiree, which claims a job
+	// without a new posting or backup poll.
+	jobID := uuid.New()
+	err = fs.sendCtx(ctx, database.ProvisionerJob{ID: jobID}, nil)
+	require.NoError(t, err)
+	job := unkeyed.success(ctx)
+	require.Equal(t, jobID, job.ID)
 }
 
 // TestAcquirer_WaitsOnNoJobs tests that after a call that returns no jobs, Acquirer waits for a new
@@ -571,6 +621,10 @@ type fakeOrderedStore struct {
 	mu     sync.Mutex
 	params []database.AcquireProvisionerJobParams
 
+	// keyDeleted controls GetProvisionerKeyByID: when set, the key reads as
+	// deleted.
+	keyDeleted atomic.Bool
+
 	// inflight and overlaps track whether any calls from workers overlap with
 	// one another
 	inflight map[uuid.UUID]bool
@@ -608,6 +662,19 @@ func (s *fakeOrderedStore) AcquireProvisionerJob(
 	s.mu.Unlock()
 
 	return job, err
+}
+
+func (s *fakeOrderedStore) GetProvisionerKeyByID(_ context.Context, id uuid.UUID) (database.ProvisionerKey, error) {
+	if s.keyDeleted.Load() {
+		return database.ProvisionerKey{}, sql.ErrNoRows
+	}
+	return database.ProvisionerKey{ID: id}, nil
+}
+
+func (s *fakeOrderedStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.params)
 }
 
 func (s *fakeOrderedStore) sendCtx(ctx context.Context, job database.ProvisionerJob, err error) error {
@@ -677,6 +744,10 @@ jobLoop:
 	return database.ProvisionerJob{}, sql.ErrNoRows
 }
 
+func (*fakeTaggedStore) GetProvisionerKeyByID(_ context.Context, id uuid.UUID) (database.ProvisionerKey, error) {
+	return database.ProvisionerKey{ID: id}, nil
+}
+
 // testAcquiree is a helper type that handles asynchronously calling AcquireJob
 // and asserting whether or not it returns, blocks, or is canceled.
 type testAcquiree struct {
@@ -702,8 +773,12 @@ func newTestAcquiree(t *testing.T, orgID uuid.UUID, workerID uuid.UUID, pt []dat
 }
 
 func (a *testAcquiree) startAcquire(ctx context.Context, uut *provisionerdserver.Acquirer) {
+	a.startAcquireWithKey(ctx, uut, uuid.NullUUID{})
+}
+
+func (a *testAcquiree) startAcquireWithKey(ctx context.Context, uut *provisionerdserver.Acquirer, keyID uuid.NullUUID) {
 	go func() {
-		j, e := uut.AcquireJob(ctx, a.orgID, a.workerID, a.pt, a.tags, uuid.NullUUID{})
+		j, e := uut.AcquireJob(ctx, a.orgID, a.workerID, a.pt, a.tags, keyID)
 		a.ec <- e
 		a.jc <- j
 	}()

@@ -416,6 +416,11 @@ func (s *server) AcquireJob(ctx context.Context, _ *proto.Empty) (*proto.Acquire
 		s.Logger.Debug(ctx, "successful cancel")
 		return &proto.AcquiredJob{}, nil
 	}
+	if errors.Is(err, ErrProvisionerKeyDeleted) {
+		s.Logger.Warn(ctx, "provisioner key deleted, rejecting job acquisition",
+			slog.F("provisioner_key_id", s.KeyID))
+		s.terminateOnDeletedKey()
+	}
 	if err != nil {
 		return nil, xerrors.Errorf("acquire job: %w", err)
 	}
@@ -476,6 +481,11 @@ func (s *server) AcquireJobWithCancel(stream proto.DRPCProvisionerDaemon_Acquire
 			return err
 		}
 		return nil
+	}
+	if errors.Is(je.err, ErrProvisionerKeyDeleted) {
+		s.Logger.Warn(streamCtx, "provisioner key deleted, rejecting job acquisition",
+			slog.F("provisioner_key_id", s.KeyID))
+		s.terminateOnDeletedKey()
 	}
 	if je.err != nil {
 		return xerrors.Errorf("acquire job: %w", je.err)
