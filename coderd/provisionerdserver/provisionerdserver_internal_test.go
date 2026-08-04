@@ -167,3 +167,64 @@ func TestObtainOIDCAccessToken(t *testing.T) {
 		require.Equal(t, "token", link.OAuthAccessToken)
 	})
 }
+
+// TestTerminateOnDeletedKey_Deferral verifies that session cancellation is
+// immediate when no job is active and deferred until the last active job
+// finishes otherwise.
+func TestTerminateOnDeletedKey_Deferral(t *testing.T) {
+	t.Parallel()
+
+	newTestServer := func(canceled chan struct{}) *server {
+		return &server{
+			lifecycleCtx:  context.Background(),
+			Logger:        testutil.Logger(t),
+			sessionCancel: func() { close(canceled) },
+			activeJobs:    map[uuid.UUID]struct{}{},
+		}
+	}
+	assertCanceled := func(t *testing.T, canceled chan struct{}, want bool) {
+		t.Helper()
+		select {
+		case <-canceled:
+			require.True(t, want, "session canceled unexpectedly")
+		default:
+			require.False(t, want, "expected session to be canceled")
+		}
+	}
+
+	t.Run("ImmediateWhenIdle", func(t *testing.T) {
+		t.Parallel()
+		canceled := make(chan struct{})
+		s := newTestServer(canceled)
+		s.TerminateOnDeletedKey()
+		assertCanceled(t, canceled, true)
+	})
+
+	t.Run("DeferredUntilJobsFinish", func(t *testing.T) {
+		t.Parallel()
+		canceled := make(chan struct{})
+		s := newTestServer(canceled)
+		job1, job2 := uuid.New(), uuid.New()
+		s.jobStarted(job1)
+		s.jobStarted(job2)
+
+		s.TerminateOnDeletedKey()
+		assertCanceled(t, canceled, false)
+
+		s.jobFinished(job1)
+		assertCanceled(t, canceled, false)
+
+		s.jobFinished(job2)
+		assertCanceled(t, canceled, true)
+	})
+
+	t.Run("NoPendingTerminationNoCancel", func(t *testing.T) {
+		t.Parallel()
+		canceled := make(chan struct{})
+		s := newTestServer(canceled)
+		jobID := uuid.New()
+		s.jobStarted(jobID)
+		s.jobFinished(jobID)
+		assertCanceled(t, canceled, false)
+	})
+}

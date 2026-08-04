@@ -422,9 +422,9 @@ func (api *API) provisionerDaemonServe(rw http.ResponseWriter, r *http.Request) 
 						return
 					}
 				}
-				logger.Info(ctx, "provisioner key deleted, canceling session",
+				logger.Info(ctx, "provisioner key deleted, terminating session",
 					slog.F("provisioner_key_id", authRes.keyID))
-				srvCancel()
+				srv.TerminateOnDeletedKey()
 			},
 		)
 		if err != nil {
