@@ -204,6 +204,11 @@ func NewServer(
 	if lifecycleCtx == nil {
 		return nil, xerrors.New("ctx is nil")
 	}
+	// A deletable key's session must be cancelable, otherwise key deletion
+	// cannot terminate it.
+	if codersdk.IsDeletableProvisionerKey(options.KeyID) && options.SessionCancel == nil {
+		return nil, xerrors.New("SessionCancel is required when KeyID is a deletable provisioner key")
+	}
 	if quotaCommitter == nil {
 		return nil, xerrors.New("quotaCommitter is nil")
 	}
