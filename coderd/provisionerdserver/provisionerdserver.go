@@ -84,7 +84,8 @@ type Options struct {
 	// zero value if it did not authenticate with a key.
 	KeyID uuid.UUID
 
-	// SessionCancel, if set, terminates the daemon's session.
+	// SessionCancel terminates the daemon's session. Required when KeyID is a
+	// deletable provisioner key; optional otherwise.
 	SessionCancel context.CancelFunc
 
 	// Clock for testing
@@ -398,10 +399,11 @@ func (s *server) keyDeleted(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-// TerminateOnDeletedKey cancels the session, when a cancel is configured, so
-// the daemon stops after its key is deleted. Cancellation is deferred while a
-// job claimed by this session is active so the daemon can report the job's
-// result; the last active job's completion performs it.
+// TerminateOnDeletedKey cancels the session so the daemon stops after its key
+// is deleted. Cancellation is deferred while a job claimed by this session is
+// active so the daemon can report the job's result; the last active job's
+// completion performs it. Only reached for deletable keys, for which NewServer
+// guarantees sessionCancel is non-nil.
 func (s *server) TerminateOnDeletedKey() {
 	s.jobMu.Lock()
 	if len(s.activeJobs) > 0 {
@@ -412,9 +414,7 @@ func (s *server) TerminateOnDeletedKey() {
 		return
 	}
 	s.jobMu.Unlock()
-	if s.sessionCancel != nil {
-		s.sessionCancel()
-	}
+	s.sessionCancel()
 }
 
 // jobStarted records a job claimed by this session as active.
@@ -437,9 +437,7 @@ func (s *server) jobFinished(id uuid.UUID) {
 	}
 	s.Logger.Warn(s.lifecycleCtx, "provisioner key deleted, canceling session after job completion",
 		slog.F("provisioner_key_id", s.KeyID))
-	if s.sessionCancel != nil {
-		s.sessionCancel()
-	}
+	s.sessionCancel()
 }
 
 // acquireKeyID returns the provisioner key constraint for job acquisition: the
