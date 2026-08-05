@@ -690,7 +690,7 @@ func (OAuth2ProviderApp) RBACObject() rbac.Object {
 // An unset or unrecognized client type reads as confidential, so an app can
 // never skip client authentication by accident.
 func (a OAuth2ProviderApp) IsPublic() bool {
-	return a.ClientType.String == "public"
+	return a.ClientType.String == OAuth2ProviderAppClientTypePublic
 }
 
 func (a GetOAuth2ProviderAppsByUserIDRow) RBACObject() rbac.Object {

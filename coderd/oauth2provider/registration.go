@@ -73,7 +73,7 @@ func CreateDynamicClientRegistration(db database.Store, accessURL *url.URL, audi
 		req = req.ApplyDefaults()
 
 		clientType := req.DetermineClientType()
-		isPublic := clientType == "public"
+		isPublic := clientType == codersdk.OAuth2ClientTypePublic
 
 		// Generate client credentials. Public clients authenticate with PKCE
 		// alone and never receive a secret (RFC 7591 §2, OAuth 2.1 §2.1).
@@ -335,11 +335,23 @@ func UpdateClientConfiguration(db database.Store, auditor *audit.Auditor, logger
 		// rejecting metadata the server will not accept). Flipping it would
 		// either drop the secret requirement for a client that has one, or
 		// mark a client confidential when it has no secret and no way to be
-		// issued one. Comparing the derived client type rather than the raw
-		// auth method keeps client_secret_basic and client_secret_post
-		// interchangeable, since both are confidential.
+		// issued one.
+		//
+		// Only an update that actually changes token_endpoint_auth_method is
+		// rejected. Clients registered before client_type was derived from the
+		// auth method can have the two disagree: the auth method was persisted
+		// verbatim while the type was always "confidential", so an app can be
+		// stored as confidential with an auth method of "none". Comparing the
+		// derived type alone would reject those clients forever, including when
+		// they resend the exact metadata GET reports, leaving re-registration as
+		// the only recovery.
+		//
+		// Comparing derived types rather than raw auth methods keeps
+		// client_secret_basic and client_secret_post interchangeable, since both
+		// are confidential.
 		clientType := req.DetermineClientType()
-		if clientType != existingApp.ClientType.String {
+		if req.TokenEndpointAuthMethod != codersdk.OAuth2TokenEndpointAuthMethod(existingApp.TokenEndpointAuthMethod.String) &&
+			clientType != existingApp.ClientType.String {
 			writeOAuth2RegistrationError(ctx, rw, http.StatusBadRequest,
 				"invalid_client_metadata",
 				"token_endpoint_auth_method cannot change an existing client between public and confidential")
@@ -350,13 +362,18 @@ func UpdateClientConfiguration(db database.Store, auditor *audit.Auditor, logger
 		now := dbtime.Now()
 		//nolint:gocritic // OAuth2 system context — RFC 7592 client configuration endpoint
 		updatedApp, err := db.UpdateOAuth2ProviderAppByClientID(dbauthz.AsSystemOAuth2(ctx), database.UpdateOAuth2ProviderAppByClientIDParams{
-			ID:                      clientID,
-			UpdatedAt:               now,
-			Name:                    req.GenerateClientName(),
-			Icon:                    req.LogoURI,
-			CallbackURL:             req.RedirectURIs[0], // Primary redirect URI
-			RedirectUris:            req.RedirectURIs,
-			ClientType:              sql.NullString{String: clientType, Valid: true},
+			ID:           clientID,
+			UpdatedAt:    now,
+			Name:         req.GenerateClientName(),
+			Icon:         req.LogoURI,
+			CallbackURL:  req.RedirectURIs[0], // Primary redirect URI
+			RedirectUris: req.RedirectURIs,
+			// Carried through verbatim. The guard above rejects a request that
+			// would change the type, so re-deriving it here could only ever
+			// differ for a legacy row whose stored type and auth method
+			// disagree, silently converting it to public while it still holds a
+			// secret.
+			ClientType:              existingApp.ClientType,
 			ClientSecretExpiresAt:   sql.NullTime{}, // No expiration for now
 			GrantTypes:              slice.ToStrings(req.GrantTypes),
 			ResponseTypes:           slice.ToStrings(req.ResponseTypes),

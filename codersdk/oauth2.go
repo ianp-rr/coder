@@ -269,6 +269,13 @@ const (
 	OAuth2TokenEndpointAuthMethodNone              OAuth2TokenEndpointAuthMethod = "none"
 )
 
+// OAuth2 client types (RFC 7591 §2, OAuth 2.1 §2.1). A confidential client
+// authenticates with a secret; a public client authenticates with PKCE alone.
+const (
+	OAuth2ClientTypeConfidential = "confidential"
+	OAuth2ClientTypePublic       = "public"
+)
+
 func (m OAuth2TokenEndpointAuthMethod) Valid() bool {
 	switch m {
 	case OAuth2TokenEndpointAuthMethodClientSecretBasic,
@@ -533,9 +540,9 @@ func (req OAuth2ClientRegistrationRequest) ApplyDefaults() OAuth2ClientRegistrat
 // already defaulted to "client_secret_basic" and is not misread as public.
 func (req *OAuth2ClientRegistrationRequest) DetermineClientType() string {
 	if req.TokenEndpointAuthMethod == OAuth2TokenEndpointAuthMethodNone {
-		return "public"
+		return OAuth2ClientTypePublic
 	}
-	return "confidential"
+	return OAuth2ClientTypeConfidential
 }
 
 // GenerateClientName generates a client name if not provided

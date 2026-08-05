@@ -19,6 +19,7 @@ import (
 	"cdr.dev/slog/v3/sloggers/slogtest"
 	"github.com/coder/coder/v2/coderd/audit"
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/dbgen"
 	"github.com/coder/coder/v2/coderd/database/dbmock"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	"github.com/coder/coder/v2/coderd/oauth2provider"
@@ -356,18 +357,21 @@ func TestUpdateClientConfiguration_ClientTypeIsImmutable(t *testing.T) {
 		updateTo          codersdk.OAuth2TokenEndpointAuthMethod
 		wantStatus        int
 		wantFinalCallback string
+		wantClientType    string
 	}{
 		{
-			name:       "ConfidentialToPublicIsRejected",
-			registerAs: codersdk.OAuth2TokenEndpointAuthMethodClientSecretBasic,
-			updateTo:   codersdk.OAuth2TokenEndpointAuthMethodNone,
-			wantStatus: http.StatusBadRequest,
+			name:           "ConfidentialToPublicIsRejected",
+			registerAs:     codersdk.OAuth2TokenEndpointAuthMethodClientSecretBasic,
+			updateTo:       codersdk.OAuth2TokenEndpointAuthMethodNone,
+			wantStatus:     http.StatusBadRequest,
+			wantClientType: "confidential",
 		},
 		{
-			name:       "PublicToConfidentialIsRejected",
-			registerAs: codersdk.OAuth2TokenEndpointAuthMethodNone,
-			updateTo:   codersdk.OAuth2TokenEndpointAuthMethodClientSecretBasic,
-			wantStatus: http.StatusBadRequest,
+			name:           "PublicToConfidentialIsRejected",
+			registerAs:     codersdk.OAuth2TokenEndpointAuthMethodNone,
+			updateTo:       codersdk.OAuth2TokenEndpointAuthMethodClientSecretBasic,
+			wantStatus:     http.StatusBadRequest,
+			wantClientType: "public",
 		},
 		{
 			// Both are confidential, so the guard must not fire.
@@ -376,6 +380,7 @@ func TestUpdateClientConfiguration_ClientTypeIsImmutable(t *testing.T) {
 			updateTo:          codersdk.OAuth2TokenEndpointAuthMethodClientSecretPost,
 			wantStatus:        http.StatusOK,
 			wantFinalCallback: "https://example.com/updated-callback",
+			wantClientType:    "confidential",
 		},
 		{
 			name:              "PublicToPublicIsAllowed",
@@ -383,6 +388,7 @@ func TestUpdateClientConfiguration_ClientTypeIsImmutable(t *testing.T) {
 			updateTo:          codersdk.OAuth2TokenEndpointAuthMethodNone,
 			wantStatus:        http.StatusOK,
 			wantFinalCallback: "https://example.com/updated-callback",
+			wantClientType:    "public",
 		},
 	}
 
@@ -439,6 +445,11 @@ func TestUpdateClientConfiguration_ClientTypeIsImmutable(t *testing.T) {
 			app, err := db.GetOAuth2ProviderAppByClientID(ctx, clientID)
 			require.NoError(t, err)
 
+			// client_type is what IsPublic() reads to decide whether the token
+			// endpoint validates a secret, so it must be unchanged whether the
+			// update was accepted or rejected.
+			require.Equal(t, tt.wantClientType, app.ClientType.String)
+
 			if tt.wantStatus != http.StatusOK {
 				var errResp map[string]string
 				require.NoError(t, json.Unmarshal(updateRW.Body.Bytes(), &errResp))
@@ -451,6 +462,94 @@ func TestUpdateClientConfiguration_ClientTypeIsImmutable(t *testing.T) {
 
 			require.Equal(t, tt.wantFinalCallback, app.CallbackURL)
 			require.Equal(t, string(tt.updateTo), app.TokenEndpointAuthMethod.String)
+		})
+	}
+}
+
+// TestUpdateClientConfiguration_LegacyAuthMethodMismatch covers clients that
+// registered before client_type was derived from token_endpoint_auth_method.
+// Registration persisted the requested auth method verbatim while hardcoding
+// client_type to "confidential", and "none" has always passed validation, so
+// apps stored as confidential with an auth method of "none" exist in any
+// deployment where a native or MCP client self-registered. That is the exact
+// population public clients are for.
+//
+// Such a client must still be able to manage its registration. Comparing only
+// the derived client type would reject it forever, including when it resends
+// the metadata GET reports, leaving re-registration as the only recovery. It
+// must also not be silently converted to public, since it holds a secret that
+// would stop being required.
+func TestUpdateClientConfiguration_LegacyAuthMethodMismatch(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		updateTo codersdk.OAuth2TokenEndpointAuthMethod
+	}{
+		{
+			// The read-modify-write shape: echo back what GET reports.
+			name:     "ResendingStoredAuthMethodIsAccepted",
+			updateTo: codersdk.OAuth2TokenEndpointAuthMethodNone,
+		},
+		{
+			// Moving to a secret-based method matches the stored confidential
+			// type, so it is allowed and repairs the divergence.
+			name:     "MovingToSecretBasedMethodIsAccepted",
+			updateTo: codersdk.OAuth2TokenEndpointAuthMethodClientSecretBasic,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := testutil.Context(t, testutil.WaitLong)
+
+			db, _ := dbtestutil.NewDB(t)
+			require.NoError(t, db.UpsertOAuth2DCREnabled(ctx, true))
+
+			legacy := dbgen.OAuth2ProviderApp(t, db, database.OAuth2ProviderApp{
+				CallbackURL:             "https://example.com/callback",
+				RedirectUris:            []string{"https://example.com/callback"},
+				ClientType:              sql.NullString{String: "confidential", Valid: true},
+				TokenEndpointAuthMethod: sql.NullString{String: "none", Valid: true},
+				DynamicallyRegistered:   sql.NullBool{Bool: true, Valid: true},
+			})
+			// Registration minted a secret unconditionally back then.
+			_ = dbgen.OAuth2ProviderAppSecret(t, db, database.OAuth2ProviderAppSecret{AppID: legacy.ID})
+
+			logger := slogtest.Make(t, nil)
+			auditor := audit.NewNop()
+			handler := tracing.StatusWriterMiddleware(oauth2provider.UpdateClientConfiguration(db, &auditor, logger))
+
+			body, err := json.Marshal(codersdk.OAuth2ClientRegistrationRequest{
+				RedirectURIs:            []string{"https://example.com/updated-callback"},
+				TokenEndpointAuthMethod: tt.updateTo,
+			})
+			require.NoError(t, err)
+
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("client_id", legacy.ID.String())
+			r := httptest.NewRequest(http.MethodPut, "/oauth2/clients/"+legacy.ID.String(),
+				bytes.NewReader(body)).WithContext(context.WithValue(ctx, chi.RouteCtxKey, rctx))
+			r.Header.Set("Content-Type", "application/json")
+			rw := httptest.NewRecorder()
+
+			handler.ServeHTTP(rw, r)
+			require.Equal(t, http.StatusOK, rw.Code, "body: %s", rw.Body.String())
+
+			app, err := db.GetOAuth2ProviderAppByClientID(ctx, legacy.ID)
+			require.NoError(t, err)
+			require.Equal(t, "https://example.com/updated-callback", app.CallbackURL)
+			require.Equal(t, string(tt.updateTo), app.TokenEndpointAuthMethod.String)
+
+			// The update must not convert the client to public. It still holds
+			// a secret, and IsPublic() reading "public" here would stop the
+			// token endpoint from requiring it.
+			require.Equal(t, "confidential", app.ClientType.String)
+			require.False(t, app.IsPublic())
+			secrets, err := db.GetOAuth2ProviderAppSecretsByAppID(ctx, legacy.ID)
+			require.NoError(t, err)
+			require.Len(t, secrets, 1)
 		})
 	}
 }

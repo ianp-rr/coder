@@ -6430,6 +6430,20 @@ export interface OAuth2ClientRegistrationResponse {
 	readonly registration_client_uri: string;
 }
 
+// From codersdk/oauth2.go
+/**
+ * OAuth2 client types (RFC 7591 §2, OAuth 2.1 §2.1). A confidential client
+ * authenticates with a secret; a public client authenticates with PKCE alone.
+ */
+export const OAuth2ClientTypeConfidential = "confidential";
+
+// From codersdk/oauth2.go
+/**
+ * OAuth2 client types (RFC 7591 §2, OAuth 2.1 §2.1). A confidential client
+ * authenticates with a secret; a public client authenticates with PKCE alone.
+ */
+export const OAuth2ClientTypePublic = "public";
+
 // From codersdk/deployment.go
 export interface OAuth2Config {
 	readonly github: OAuth2GithubConfig;
