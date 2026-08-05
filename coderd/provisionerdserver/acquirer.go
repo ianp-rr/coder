@@ -19,6 +19,7 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/coderd/database/provisionerjobs"
 	"github.com/coder/coder/v2/coderd/database/pubsub"
+	"github.com/coder/coder/v2/codersdk"
 )
 
 const (
@@ -90,13 +91,15 @@ func NewAcquirer(ctx context.Context, logger slog.Logger, store AcquirerStore, p
 // tags from the database.  The call blocks until a job is acquired, the context is
 // done, or the database returns an error _other_ than that no jobs are available.
 // If no jobs are available, this method handles retrying as appropriate.
-// When keyID is valid, the claim only succeeds while that provisioner key row
-// still exists; pass an invalid NullUUID for daemons without a deletable key.
+// When keyID is a deletable provisioner key, the claim only succeeds while
+// that key row still exists. Reserved keys and the zero value are not
+// checked, as they have no row to delete.
 func (a *Acquirer) AcquireJob(
-	ctx context.Context, organization uuid.UUID, worker uuid.UUID, pt []database.ProvisionerType, tags Tags, keyID uuid.NullUUID,
+	ctx context.Context, organization uuid.UUID, worker uuid.UUID, pt []database.ProvisionerType, tags Tags, keyID uuid.UUID,
 ) (
 	retJob database.ProvisionerJob, retErr error,
 ) {
+	deletableKey := codersdk.IsDeletableProvisionerKey(keyID)
 	logger := a.logger.With(
 		slog.F("organization_id", organization),
 		slog.F("worker_id", worker),
@@ -136,18 +139,18 @@ func (a *Acquirer) AcquireJob(
 				},
 				Types:            pt,
 				ProvisionerTags:  dbTags,
-				ProvisionerKeyID: keyID,
+				ProvisionerKeyID: uuid.NullUUID{UUID: keyID, Valid: deletableKey},
 			})
 			if xerrors.Is(err, sql.ErrNoRows) {
 				// The claim query returns no rows both when no job is pending and
 				// when the worker's deletable key was deleted (deleted keys cannot
 				// lock jobs). Disambiguate so a dead-key acquiree exits instead of
 				// re-parking and consuming wakeups its peers could have used.
-				if keyID.Valid {
+				if deletableKey {
 					_, kerr := a.store.GetProvisionerKeyByID(
 						//nolint:gocritic // The acquire context has no actor that can
 						// read provisioner keys, so scope the read to this narrow subject.
-						dbauthz.AsSystemReadProvisionerDaemons(ctx), keyID.UUID)
+						dbauthz.AsSystemReadProvisionerDaemons(ctx), keyID)
 					if xerrors.Is(kerr, sql.ErrNoRows) {
 						logger.Debug(ctx, "provisioner key deleted, exiting acquire")
 						// cancel (not done) hands an in-progress clearance to another

@@ -132,7 +132,7 @@ func TestAcquirer_ProvisionerKeyDeleted(t *testing.T) {
 	// The keyed acquiree starts first; as the domain's first member it gets
 	// immediate clearance and blocks in the store call.
 	keyed := newTestAcquiree(t, orgID, uuid.New(), pt, tags)
-	keyed.startAcquireWithKey(ctx, uut, uuid.NullUUID{UUID: uuid.New(), Valid: true})
+	keyed.startAcquireWithKey(ctx, uut, uuid.New())
 	require.Eventually(t, func() bool { return fs.callCount() == 1 }, testutil.WaitShort, testutil.IntervalFast)
 
 	// The unkeyed acquiree joins the same domain and parks without clearance.
@@ -554,7 +554,7 @@ func TestAcquirer_MatchTags(t *testing.T) {
 			if tt.unmatchedOrg {
 				acquireOrgID = uuid.New()
 			}
-			aj, err := acq.AcquireJob(ctx, acquireOrgID, uuid.New(), ptypes, tt.acquireJobTags, uuid.NullUUID{})
+			aj, err := acq.AcquireJob(ctx, acquireOrgID, uuid.New(), ptypes, tt.acquireJobTags, uuid.Nil)
 			if tt.expectAcquire {
 				assert.NoError(t, err)
 				assert.Equal(t, pj.ID, aj.ID)
@@ -773,10 +773,10 @@ func newTestAcquiree(t *testing.T, orgID uuid.UUID, workerID uuid.UUID, pt []dat
 }
 
 func (a *testAcquiree) startAcquire(ctx context.Context, uut *provisionerdserver.Acquirer) {
-	a.startAcquireWithKey(ctx, uut, uuid.NullUUID{})
+	a.startAcquireWithKey(ctx, uut, uuid.Nil)
 }
 
-func (a *testAcquiree) startAcquireWithKey(ctx context.Context, uut *provisionerdserver.Acquirer, keyID uuid.NullUUID) {
+func (a *testAcquiree) startAcquireWithKey(ctx context.Context, uut *provisionerdserver.Acquirer, keyID uuid.UUID) {
 	go func() {
 		j, e := uut.AcquireJob(ctx, a.orgID, a.workerID, a.pt, a.tags, keyID)
 		a.ec <- e
