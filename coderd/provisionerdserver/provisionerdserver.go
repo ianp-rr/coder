@@ -147,7 +147,8 @@ type server struct {
 	// jobMu guards activeJobs and terminationPending.
 	jobMu sync.Mutex
 	// activeJobs tracks jobs claimed by this session that have not yet been
-	// completed or failed.
+	// completed or failed. The in-tree provisioner daemon runs jobs serially,
+	// so at most one entry is expected; the protocol does not enforce this.
 	activeJobs map[uuid.UUID]struct{}
 	// terminationPending records a deleted-key termination that arrived while
 	// a job was active; it is performed when the last active job finishes.
