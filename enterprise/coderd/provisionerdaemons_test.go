@@ -230,6 +230,12 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		// re-check. Deleting the key on that read reproduces a key deleted
 		// between authentication and subscription, which the re-check must
 		// catch even though no pubsub notification is delivered.
+		//
+		// The heartbeat watchdog performs the same GetProvisionerKeyByID
+		// read, so this test only pins the post-subscribe re-check while the
+		// heartbeat interval (1m default) exceeds the test deadline
+		// (testutil.WaitLong). If either changes, the heartbeat could trip
+		// the store hook instead and mask removal of the re-check.
 		db, ps := dbtestutil.NewDB(t)
 		store := &deleteKeyOnReadStore{Store: db}
 		client, _ := coderdenttest.New(t, &coderdenttest.Options{
@@ -288,6 +294,12 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		// re-check the key on the dropped-messages signal. This test deletes
 		// the key directly in the database (no notification published) and then
 		// drives the captured listener with ErrDroppedMessages.
+		//
+		// The heartbeat watchdog also detects a deleted key, so this test
+		// only pins the dropped-messages re-check while the heartbeat
+		// interval (1m default) exceeds the test deadline
+		// (testutil.WaitLong). If either changes, the heartbeat could close
+		// the session instead and mask removal of the re-check.
 		db, ps := dbtestutil.NewDB(t)
 		capturePS := newCaptureKeyDeletePubsub(ps)
 		client, _ := coderdenttest.New(t, &coderdenttest.Options{
