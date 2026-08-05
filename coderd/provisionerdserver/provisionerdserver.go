@@ -151,8 +151,8 @@ type server struct {
 	// completed or failed. The in-tree provisioner daemon runs jobs serially,
 	// so at most one entry is expected; the protocol does not enforce this.
 	activeJobs map[uuid.UUID]struct{}
-	// terminationPending records a deleted-key termination that arrived while
-	// a job was active; it is performed when the last active job finishes.
+	// terminationPending records a termination request that arrived while a
+	// job was active; it is performed when the last active job finishes.
 	terminationPending bool
 
 	metrics *Metrics
@@ -190,9 +190,9 @@ func (t Tags) Valid() error {
 // used by the serve handlers.
 type Server interface {
 	proto.DRPCProvisionerDaemonServer
-	// TerminateOnDeletedKey cancels the session once no acquired job is
+	// TerminateSession cancels the session once no acquired job is
 	// active. Safe to call from any goroutine.
-	TerminateOnDeletedKey()
+	TerminateSession()
 }
 
 func NewServer(
@@ -347,7 +347,7 @@ func (s *server) heartbeatLoop() {
 			} else if deleted {
 				s.Logger.Warn(hbCtx, "provisioner key deleted, canceling session",
 					slog.F("provisioner_key_id", s.KeyID))
-				s.TerminateOnDeletedKey()
+				s.TerminateSession()
 			}
 			hbCancel()
 			elapsed := s.timeNow().Sub(start)
@@ -399,12 +399,11 @@ func (s *server) keyDeleted(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-// TerminateOnDeletedKey cancels the session so the daemon stops after its key
-// is deleted. Cancellation is deferred while a job claimed by this session is
-// active so the daemon can report the job's result; the last active job's
-// completion performs it. Only reached for deletable keys, for which NewServer
-// guarantees sessionCancel is non-nil.
-func (s *server) TerminateOnDeletedKey() {
+// TerminateSession cancels the session. Cancellation is deferred while a job
+// claimed by this session is active so the daemon can report the job's
+// result; the last active job's completion performs it. Requires a configured
+// sessionCancel.
+func (s *server) TerminateSession() {
 	s.jobMu.Lock()
 	if len(s.activeJobs) > 0 {
 		s.terminationPending = true
@@ -435,7 +434,7 @@ func (s *server) jobFinished(id uuid.UUID) {
 	if !terminate {
 		return
 	}
-	s.Logger.Warn(s.lifecycleCtx, "provisioner key deleted, canceling session after job completion",
+	s.Logger.Warn(s.lifecycleCtx, "canceling session after job completion",
 		slog.F("provisioner_key_id", s.KeyID))
 	s.sessionCancel()
 }
@@ -458,7 +457,7 @@ func (s *server) AcquireJob(ctx context.Context, _ *proto.Empty) (*proto.Acquire
 	} else if deleted {
 		s.Logger.Warn(ctx, "provisioner key deleted, rejecting job acquisition",
 			slog.F("provisioner_key_id", s.KeyID))
-		s.TerminateOnDeletedKey()
+		s.TerminateSession()
 		return nil, xerrors.Errorf("acquire job: %w", ErrProvisionerKeyDeleted)
 	}
 	// Since AcquireJob blocks until a job is available, we set a long (5s by default) timeout.  This allows back-level
@@ -474,7 +473,7 @@ func (s *server) AcquireJob(ctx context.Context, _ *proto.Empty) (*proto.Acquire
 	if errors.Is(err, ErrProvisionerKeyDeleted) {
 		s.Logger.Warn(ctx, "provisioner key deleted, rejecting job acquisition",
 			slog.F("provisioner_key_id", s.KeyID))
-		s.TerminateOnDeletedKey()
+		s.TerminateSession()
 	}
 	if err != nil {
 		return nil, xerrors.Errorf("acquire job: %w", err)
@@ -510,7 +509,7 @@ func (s *server) AcquireJobWithCancel(stream proto.DRPCProvisionerDaemon_Acquire
 	} else if deleted {
 		s.Logger.Warn(streamCtx, "provisioner key deleted, rejecting job acquisition",
 			slog.F("provisioner_key_id", s.KeyID))
-		s.TerminateOnDeletedKey()
+		s.TerminateSession()
 		return xerrors.Errorf("acquire job: %w", ErrProvisionerKeyDeleted)
 	}
 	acqCtx, acqCancel := context.WithCancel(streamCtx)
@@ -546,7 +545,7 @@ func (s *server) AcquireJobWithCancel(stream proto.DRPCProvisionerDaemon_Acquire
 	if errors.Is(je.err, ErrProvisionerKeyDeleted) {
 		s.Logger.Warn(streamCtx, "provisioner key deleted, rejecting job acquisition",
 			slog.F("provisioner_key_id", s.KeyID))
-		s.TerminateOnDeletedKey()
+		s.TerminateSession()
 	}
 	if je.err != nil {
 		return xerrors.Errorf("acquire job: %w", je.err)

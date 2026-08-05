@@ -424,7 +424,7 @@ func (api *API) provisionerDaemonServe(rw http.ResponseWriter, r *http.Request) 
 				}
 				logger.Info(ctx, "provisioner key deleted, terminating session",
 					slog.F("provisioner_key_id", authRes.keyID))
-				srv.TerminateOnDeletedKey()
+				srv.TerminateSession()
 			},
 		)
 		if err != nil {

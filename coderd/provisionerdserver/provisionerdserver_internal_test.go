@@ -168,10 +168,10 @@ func TestObtainOIDCAccessToken(t *testing.T) {
 	})
 }
 
-// TestTerminateOnDeletedKey_Deferral verifies that session cancellation is
+// TestTerminateSession_Deferral verifies that session cancellation is
 // immediate when no job is active and deferred until the last active job
 // finishes otherwise.
-func TestTerminateOnDeletedKey_Deferral(t *testing.T) {
+func TestTerminateSession_Deferral(t *testing.T) {
 	t.Parallel()
 
 	newTestServer := func(canceled chan struct{}) *server {
@@ -196,7 +196,7 @@ func TestTerminateOnDeletedKey_Deferral(t *testing.T) {
 		t.Parallel()
 		canceled := make(chan struct{})
 		s := newTestServer(canceled)
-		s.TerminateOnDeletedKey()
+		s.TerminateSession()
 		assertCanceled(t, canceled, true)
 	})
 
@@ -208,7 +208,7 @@ func TestTerminateOnDeletedKey_Deferral(t *testing.T) {
 		s.jobStarted(job1)
 		s.jobStarted(job2)
 
-		s.TerminateOnDeletedKey()
+		s.TerminateSession()
 		assertCanceled(t, canceled, false)
 
 		s.jobFinished(job1)
