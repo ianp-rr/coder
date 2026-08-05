@@ -9,10 +9,13 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 
+	"cdr.dev/slog/v3"
+
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbgen"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
+	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/testutil"
 )
 
@@ -166,6 +169,30 @@ func TestObtainOIDCAccessToken(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "token", link.OAuthAccessToken)
 	})
+}
+
+// TestNewServer_SessionCancelRequired verifies that constructing a server for
+// a deletable provisioner key without a SessionCancel fails, while reserved
+// keys do not require one.
+func TestNewServer_SessionCancelRequired(t *testing.T) {
+	t.Parallel()
+
+	// The SessionCancel validation runs before the remaining nil-pointer
+	// checks, so the other arguments can be zero values.
+	newServer := func(keyID uuid.UUID) error {
+		_, err := NewServer(
+			context.Background(), "", nil, uuid.Nil, uuid.Nil, slog.Logger{},
+			nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+			Options{KeyID: keyID},
+			nil, nil, nil, codersdk.Experiments{},
+		)
+		return err
+	}
+
+	require.ErrorContains(t, newServer(uuid.New()), "SessionCancel is required")
+	// A reserved key passes the SessionCancel check; the error comes from the
+	// next validation instead.
+	require.ErrorContains(t, newServer(codersdk.ProvisionerKeyUUIDPSK), "quotaCommitter is nil")
 }
 
 // TestTerminateSession_Deferral verifies that session cancellation is

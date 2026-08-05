@@ -15,8 +15,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/xerrors"
 
 	"cdr.dev/slog/v3/sloggers/slogtest"
+
 	"github.com/coder/coder/v2/apiversion"
 	"github.com/coder/coder/v2/buildinfo"
 	"github.com/coder/coder/v2/coderd/coderdtest"
@@ -226,16 +228,13 @@ func TestProvisionerDaemonServe(t *testing.T) {
 	t.Run("KeyDeletedDuringSetupClosesSession", func(t *testing.T) {
 		t.Parallel()
 		// Provisioner key auth fetches the key by name, so the only
-		// GetProvisionerKeyByID in the serve path is the post-subscribe
-		// re-check. Deleting the key on that read reproduces a key deleted
-		// between authentication and subscription, which the re-check must
-		// catch even though no pubsub notification is delivered.
-		//
-		// The heartbeat watchdog performs the same GetProvisionerKeyByID
-		// read, so this test only pins the post-subscribe re-check while the
-		// heartbeat interval (1m default) exceeds the test deadline
-		// (testutil.WaitLong). If either changes, the heartbeat could trip
-		// the store hook instead and mask removal of the re-check.
+		// GetProvisionerKeyByID reads in the serve path are the post-subscribe
+		// re-check and the heartbeat watchdog, whose first beat fires
+		// immediately at session start. Deleting the key on the first such
+		// read reproduces a key deleted between authentication and
+		// subscription; either reader must close the session, so this test
+		// pins the setup-window behavior rather than the re-check in
+		// isolation. No pubsub notification is delivered.
 		db, ps := dbtestutil.NewDB(t)
 		store := &deleteKeyOnReadStore{Store: db}
 		client, _ := coderdenttest.New(t, &coderdenttest.Options{
@@ -281,8 +280,8 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatal("timed out waiting for re-check to close the session")
 		}
-		// Confirm the close was driven by the re-check's key lookup, not another
-		// path (no pubsub notification is published in this test).
+		// Confirm the close was driven by a key lookup, not another path (no
+		// pubsub notification is published in this test).
 		require.True(t, store.deleted.Load())
 	})
 
@@ -295,11 +294,12 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		// the key directly in the database (no notification published) and then
 		// drives the captured listener with ErrDroppedMessages.
 		//
-		// The heartbeat watchdog also detects a deleted key, so this test
-		// only pins the dropped-messages re-check while the heartbeat
-		// interval (1m default) exceeds the test deadline
-		// (testutil.WaitLong). If either changes, the heartbeat could close
-		// the session instead and mask removal of the re-check.
+		// The heartbeat watchdog also detects a deleted key, but its first
+		// beat fires at session start while the key still exists and later
+		// beats (1m default) exceed the test deadline (testutil.WaitLong), so
+		// a close after the signal is attributable to the dropped-messages
+		// re-check. If either timing changes, the heartbeat could close the
+		// session instead and mask removal of the re-check.
 		db, ps := dbtestutil.NewDB(t)
 		capturePS := newCaptureKeyDeletePubsub(ps)
 		client, _ := coderdenttest.New(t, &coderdenttest.Options{
@@ -362,6 +362,155 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		// Deliver the dropped-messages signal the reconnect would have produced.
 		listener(ctx, nil, dbpubsub.ErrDroppedMessages)
 
+		select {
+		case <-srv.DRPCConn().Closed():
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for dropped-message re-check to close the session")
+		}
+	})
+
+	t.Run("DroppedMessageKeyExistsKeepsSession", func(t *testing.T) {
+		t.Parallel()
+		// A dropped-messages signal with the key still present must leave the
+		// session running; only a confirmed missing key may terminate it.
+		db, ps := dbtestutil.NewDB(t)
+		capturePS := newCaptureKeyDeletePubsub(ps)
+		client, _ := coderdenttest.New(t, &coderdenttest.Options{
+			Options: &coderdtest.Options{
+				Database: db,
+				Pubsub:   capturePS,
+				// The wrapper is not a *PGPubsub, so provide the real one for
+				// replica sync.
+				ReplicaSyncPubsub: ps.(*dbpubsub.PGPubsub),
+			},
+			LicenseOptions: &coderdenttest.LicenseOptions{
+				Features: license.Features{
+					codersdk.FeatureExternalProvisionerDaemons: 1,
+					codersdk.FeatureMultipleOrganizations:      1,
+				},
+			},
+		})
+		org := coderdenttest.CreateOrganization(t, client, coderdenttest.CreateOrganizationOptions{})
+		orgAdmin, _ := coderdtest.CreateAnotherUser(t, client, org.ID, rbac.ScopedRoleOrgAdmin(org.ID))
+		ctx := testutil.Context(t, testutil.WaitLong)
+
+		res, err := orgAdmin.CreateProvisionerKey(ctx, org.ID, codersdk.CreateProvisionerKeyRequest{
+			Name: "my-key",
+		})
+		require.NoError(t, err)
+		keys, err := orgAdmin.ListProvisionerKeys(ctx, org.ID)
+		require.NoError(t, err)
+		require.Len(t, keys, 1)
+		keyID := keys[0].ID
+		capturePS.target.Store(ptr.Ref(pubsub.ProvisionerKeyDeletedChannel(keyID)))
+
+		srv, err := orgAdmin.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
+			Name:         testutil.MustRandString(t, 63),
+			Organization: org.ID,
+			Provisioners: []codersdk.ProvisionerType{
+				codersdk.ProvisionerTypeEcho,
+			},
+			Tags:           map[string]string{},
+			ProvisionerKey: res.Key,
+		})
+		require.NoError(t, err)
+		defer srv.DRPCConn().Close()
+
+		listener := capturePS.waitListener(ctx, t)
+
+		// Deliver the dropped-messages signal without deleting the key. The
+		// re-check finds the key and the session must stay open.
+		listener(ctx, nil, dbpubsub.ErrDroppedMessages)
+		select {
+		case <-srv.DRPCConn().Closed():
+			t.Fatal("session closed although provisioner key still exists")
+		case <-time.After(testutil.IntervalMedium):
+		}
+
+		// The same signal after the key is gone closes the session, confirming
+		// the session was still fully functional above.
+		//nolint:gocritic // The test deletes the key outside the request actor.
+		err = db.DeleteProvisionerKey(dbauthz.AsSystemRestricted(ctx), keyID)
+		require.NoError(t, err)
+		listener(ctx, nil, dbpubsub.ErrDroppedMessages)
+		select {
+		case <-srv.DRPCConn().Closed():
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for dropped-message re-check to close the session")
+		}
+	})
+
+	t.Run("DroppedMessageKeyCheckErrorKeepsSession", func(t *testing.T) {
+		t.Parallel()
+		// A dropped-messages signal whose key re-check fails must leave the
+		// session running; a transient database error is not evidence of
+		// deletion.
+		db, ps := dbtestutil.NewDB(t)
+		store := &failKeyReadStore{Store: db}
+		capturePS := newCaptureKeyDeletePubsub(ps)
+		client, _ := coderdenttest.New(t, &coderdenttest.Options{
+			Options: &coderdtest.Options{
+				Database: store,
+				Pubsub:   capturePS,
+				// The wrapper is not a *PGPubsub, so provide the real one for
+				// replica sync.
+				ReplicaSyncPubsub: ps.(*dbpubsub.PGPubsub),
+			},
+			LicenseOptions: &coderdenttest.LicenseOptions{
+				Features: license.Features{
+					codersdk.FeatureExternalProvisionerDaemons: 1,
+					codersdk.FeatureMultipleOrganizations:      1,
+				},
+			},
+		})
+		org := coderdenttest.CreateOrganization(t, client, coderdenttest.CreateOrganizationOptions{})
+		orgAdmin, _ := coderdtest.CreateAnotherUser(t, client, org.ID, rbac.ScopedRoleOrgAdmin(org.ID))
+		ctx := testutil.Context(t, testutil.WaitLong)
+
+		res, err := orgAdmin.CreateProvisionerKey(ctx, org.ID, codersdk.CreateProvisionerKeyRequest{
+			Name: "my-key",
+		})
+		require.NoError(t, err)
+		keys, err := orgAdmin.ListProvisionerKeys(ctx, org.ID)
+		require.NoError(t, err)
+		require.Len(t, keys, 1)
+		keyID := keys[0].ID
+		store.keyID.Store(&keyID)
+		capturePS.target.Store(ptr.Ref(pubsub.ProvisionerKeyDeletedChannel(keyID)))
+
+		srv, err := orgAdmin.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
+			Name:         testutil.MustRandString(t, 63),
+			Organization: org.ID,
+			Provisioners: []codersdk.ProvisionerType{
+				codersdk.ProvisionerTypeEcho,
+			},
+			Tags:           map[string]string{},
+			ProvisionerKey: res.Key,
+		})
+		require.NoError(t, err)
+		defer srv.DRPCConn().Close()
+
+		listener := capturePS.waitListener(ctx, t)
+
+		// Make the key re-check fail before deleting the key, so no reader
+		// (including the immediate first heartbeat) can observe the bare
+		// deletion; then delete the key so a successful re-check would
+		// terminate. The error path must leave the session running.
+		store.fail.Store(true)
+		//nolint:gocritic // The test deletes the key outside the request actor.
+		err = db.DeleteProvisionerKey(dbauthz.AsSystemRestricted(ctx), keyID)
+		require.NoError(t, err)
+		listener(ctx, nil, dbpubsub.ErrDroppedMessages)
+		select {
+		case <-srv.DRPCConn().Closed():
+			t.Fatal("session closed although the key re-check failed")
+		case <-time.After(testutil.IntervalMedium):
+		}
+
+		// Once the re-check succeeds again it observes the deletion and closes
+		// the session.
+		store.fail.Store(false)
+		listener(ctx, nil, dbpubsub.ErrDroppedMessages)
 		select {
 		case <-srv.DRPCConn().Closed():
 		case <-ctx.Done():
@@ -1183,6 +1332,22 @@ func TestGetProvisionerDaemons(t *testing.T) {
 			})
 		}
 	})
+}
+
+// failKeyReadStore returns an error from GetProvisionerKeyByID for the key
+// identified by keyID while fail is set. All other reads pass through. keyID
+// is set after the key is created so earlier lookups are unaffected.
+type failKeyReadStore struct {
+	database.Store
+	keyID atomic.Pointer[uuid.UUID]
+	fail  atomic.Bool
+}
+
+func (s *failKeyReadStore) GetProvisionerKeyByID(ctx context.Context, id uuid.UUID) (database.ProvisionerKey, error) {
+	if target := s.keyID.Load(); target != nil && *target == id && s.fail.Load() {
+		return database.ProvisionerKey{}, xerrors.New("transient database error")
+	}
+	return s.Store.GetProvisionerKeyByID(ctx, id)
 }
 
 // deleteKeyOnReadStore deletes the provisioner key identified by keyID the

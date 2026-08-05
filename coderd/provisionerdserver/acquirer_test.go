@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
+	"golang.org/x/xerrors"
 
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
@@ -159,6 +160,71 @@ func TestAcquirer_ProvisionerKeyDeleted(t *testing.T) {
 	err = fs.sendCtx(ctx, database.ProvisionerJob{ID: jobID}, nil)
 	require.NoError(t, err)
 	job := unkeyed.success(ctx)
+	require.Equal(t, jobID, job.ID)
+}
+
+// TestAcquirer_ProvisionerKeyExists verifies that a no-rows acquire result
+// with the key still present re-parks the acquiree; ErrProvisionerKeyDeleted
+// requires the key row to actually be gone.
+func TestAcquirer_ProvisionerKeyExists(t *testing.T) {
+	t.Parallel()
+	fs := newFakeOrderedStore()
+	ps := pubsub.NewInMemory()
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
+	defer cancel()
+	logger := testutil.Logger(t)
+	uut := provisionerdserver.NewAcquirer(ctx, logger.Named("acquirer"), fs, ps)
+
+	orgID := uuid.New()
+	pt := []database.ProvisionerType{database.ProvisionerTypeEcho}
+	tags := provisionerdserver.Tags{"environment": "on-prem"}
+
+	acquiree := newTestAcquiree(t, orgID, uuid.New(), pt, tags)
+	jobID := uuid.New()
+	err := fs.sendCtx(ctx, database.ProvisionerJob{}, sql.ErrNoRows)
+	require.NoError(t, err)
+	err = fs.sendCtx(ctx, database.ProvisionerJob{ID: jobID}, nil)
+	require.NoError(t, err)
+	acquiree.startAcquireWithKey(ctx, uut, uuid.New())
+	require.Eventually(t, func() bool { return fs.callCount() == 1 }, testutil.WaitShort, testutil.IntervalFast)
+	acquiree.requireBlocked()
+
+	// A compatible posting wakes the parked acquiree and it claims the job.
+	postJob(t, ps, database.ProvisionerTypeEcho, provisionerdserver.Tags{})
+	job := acquiree.success(ctx)
+	require.Equal(t, jobID, job.ID)
+}
+
+// TestAcquirer_ProvisionerKeyCheckError verifies that a transient error from
+// the key lookup after a no-rows acquire re-parks the acquiree instead of
+// returning ErrProvisionerKeyDeleted.
+func TestAcquirer_ProvisionerKeyCheckError(t *testing.T) {
+	t.Parallel()
+	fs := newFakeOrderedStore()
+	keyErr := xerrors.New("transient database error")
+	fs.keyErr.Store(&keyErr)
+	ps := pubsub.NewInMemory()
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
+	defer cancel()
+	logger := testutil.Logger(t)
+	uut := provisionerdserver.NewAcquirer(ctx, logger.Named("acquirer"), fs, ps)
+
+	orgID := uuid.New()
+	pt := []database.ProvisionerType{database.ProvisionerTypeEcho}
+	tags := provisionerdserver.Tags{"environment": "on-prem"}
+
+	acquiree := newTestAcquiree(t, orgID, uuid.New(), pt, tags)
+	jobID := uuid.New()
+	err := fs.sendCtx(ctx, database.ProvisionerJob{}, sql.ErrNoRows)
+	require.NoError(t, err)
+	err = fs.sendCtx(ctx, database.ProvisionerJob{ID: jobID}, nil)
+	require.NoError(t, err)
+	acquiree.startAcquireWithKey(ctx, uut, uuid.New())
+	require.Eventually(t, func() bool { return fs.callCount() == 1 }, testutil.WaitShort, testutil.IntervalFast)
+	acquiree.requireBlocked()
+
+	postJob(t, ps, database.ProvisionerTypeEcho, provisionerdserver.Tags{})
+	job := acquiree.success(ctx)
 	require.Equal(t, jobID, job.ID)
 }
 
@@ -624,6 +690,9 @@ type fakeOrderedStore struct {
 	// keyDeleted controls GetProvisionerKeyByID: when set, the key reads as
 	// deleted.
 	keyDeleted atomic.Bool
+	// keyErr, when set, is returned by GetProvisionerKeyByID and takes
+	// precedence over keyDeleted.
+	keyErr atomic.Pointer[error]
 
 	// inflight and overlaps track whether any calls from workers overlap with
 	// one another
@@ -665,6 +734,9 @@ func (s *fakeOrderedStore) AcquireProvisionerJob(
 }
 
 func (s *fakeOrderedStore) GetProvisionerKeyByID(_ context.Context, id uuid.UUID) (database.ProvisionerKey, error) {
+	if err := s.keyErr.Load(); err != nil {
+		return database.ProvisionerKey{}, *err
+	}
 	if s.keyDeleted.Load() {
 		return database.ProvisionerKey{}, sql.ErrNoRows
 	}
