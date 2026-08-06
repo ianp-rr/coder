@@ -626,21 +626,11 @@ func TestOAuth2ProviderTokenExchangePublicClientCodeBelongsToDifferentApp(t *tes
 	oauth2providertest.EnableDCR(t, ownerClient)
 	ctx := testutil.Context(t, testutil.WaitLong)
 
+	// Both apps are public, so neither has a secret and the code-ownership
+	// check is the only thing binding the exchange to an app.
 	const sharedCallback = "http://localhost:8080/callback"
-	registerPublicClient := func(name string) codersdk.OAuth2ClientRegistrationResponse {
-		resp, err := ownerClient.PostOAuth2ClientRegistration(ctx, codersdk.OAuth2ClientRegistrationRequest{
-			RedirectURIs:            []string{sharedCallback},
-			ClientName:              fmt.Sprintf("%s-%d", name, time.Now().UnixNano()),
-			TokenEndpointAuthMethod: codersdk.OAuth2TokenEndpointAuthMethodNone,
-		})
-		require.NoError(t, err)
-		// A public client is issued no secret, which is what makes the
-		// code-ownership check the sole app binding below.
-		require.Empty(t, resp.ClientSecret)
-		return resp
-	}
-	appA := registerPublicClient("public-code-owner")
-	appB := registerPublicClient("public-code-thief")
+	appA := oauth2providertest.RegisterPublicClient(ctx, t, ownerClient, "public-code-owner", sharedCallback)
+	appB := oauth2providertest.RegisterPublicClient(ctx, t, ownerClient, "public-code-thief", sharedCallback)
 
 	userClient, _ := coderdtest.CreateAnotherUser(t, ownerClient, owner.OrganizationID)
 
@@ -675,7 +665,30 @@ func TestOAuth2ProviderTokenExchangePublicClientCodeBelongsToDifferentApp(t *tes
 	require.Error(t, err)
 	require.ErrorContains(t, err, "The authorization code is invalid or expired")
 
-	// The rejection must not have consumed the code: appA can still redeem
+	// PKCE is the only client authentication a public client has, so exercise
+	// its failure branches here rather than only on confidential apps. The
+	// verification currently sits outside the if !isPublic block, so a later
+	// change that moved it inside would leave every confidential test passing
+	// while public clients lost authentication entirely.
+	//
+	// A rejected verifier must also leave the code unconsumed, otherwise one
+	// bad guess would deny the legitimate client its own code.
+	_, err = cfgA.Exchange(ctx, code, oauth2.SetAuthURLParam("code_verifier", ""))
+	require.Error(t, err)
+	require.ErrorContains(t, err, "The PKCE code verifier is invalid")
+
+	wrongVerifier, _ := oauth2providertest.GeneratePKCE(t)
+	_, err = cfgA.Exchange(ctx, code, oauth2.SetAuthURLParam("code_verifier", wrongVerifier))
+	require.Error(t, err)
+	require.ErrorContains(t, err, "The PKCE code verifier is invalid")
+
+	// RFC 7636 §4.1 sets a 43-character floor. A one-character verifier hashes
+	// to a well-formed challenge, so only a length check refuses it.
+	_, err = cfgA.Exchange(ctx, code, oauth2.SetAuthURLParam("code_verifier", "a"))
+	require.Error(t, err)
+	require.ErrorContains(t, err, "The PKCE code verifier is invalid")
+
+	// The rejections must not have consumed the code: appA can still redeem
 	// its own code afterwards.
 	token, err := cfgA.Exchange(ctx, code, oauth2.SetAuthURLParam("code_verifier", verifier))
 	require.NoError(t, err)
@@ -1158,18 +1171,8 @@ func TestOAuth2PublicClientTokenLifecycle(t *testing.T) {
 			oauth2providertest.EnableDCR(t, ownerClient)
 
 			const callback = "http://localhost:8080/callback"
-			registerPublic := func(name string) codersdk.OAuth2ClientRegistrationResponse {
-				resp, err := ownerClient.PostOAuth2ClientRegistration(ctx, codersdk.OAuth2ClientRegistrationRequest{
-					RedirectURIs:            []string{callback},
-					ClientName:              fmt.Sprintf("%s-%d", name, time.Now().UnixNano()),
-					TokenEndpointAuthMethod: codersdk.OAuth2TokenEndpointAuthMethodNone,
-				})
-				require.NoError(t, err)
-				require.Empty(t, resp.ClientSecret)
-				return resp
-			}
-			app := registerPublic("public-lifecycle")
-			otherApp := registerPublic("public-lifecycle-other")
+			app := oauth2providertest.RegisterPublicClient(ctx, t, ownerClient, "public-lifecycle", callback)
+			otherApp := oauth2providertest.RegisterPublicClient(ctx, t, ownerClient, "public-lifecycle-other", callback)
 
 			appID, err := uuid.Parse(app.ClientID)
 			require.NoError(t, err)
@@ -1202,8 +1205,10 @@ func TestOAuth2PublicClientTokenLifecycle(t *testing.T) {
 				t.Helper()
 				keyID, _, err := httpmw.SplitAPIToken(accessToken)
 				require.NoError(t, err)
-				//nolint:gocritic // Reading token rows directly requires system context.
-				dbToken, err := db.GetOAuth2ProviderAppTokenByAPIKeyID(dbauthz.AsSystemRestricted(ctx), keyID)
+				// This is the raw store handle, not the dbauthz-wrapped one the
+				// server uses, so no authorization layer is in the path and no
+				// system actor is needed.
+				dbToken, err := db.GetOAuth2ProviderAppTokenByAPIKeyID(ctx, keyID)
 				require.NoError(t, err)
 				require.False(t, dbToken.AppSecretID.Valid, "public client token must have a NULL app_secret_id")
 				require.Equal(t, appID, dbToken.AppID)

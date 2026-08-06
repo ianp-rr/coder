@@ -1,7 +1,6 @@
 package oauth2provider
 
 import (
-	"database/sql"
 	"net/http"
 	"net/url"
 	"slices"
@@ -19,6 +18,16 @@ import (
 func parseScopes(scope string) []string {
 	return strings.Fields(strings.TrimSpace(scope))
 }
+
+// Named app fixtures for extractTokenRequest, whose behavior depends only on
+// the client type. Passing these rather than a zero-value app means the call
+// sites state which client type they mean instead of relying on the zero value
+// reading as confidential. IsPublic's handling of unset and unrecognized values
+// is pinned directly in database.TestOAuth2ProviderAppIsPublic.
+var (
+	confidentialApp = database.OAuth2ProviderApp{ClientType: database.OAuth2ProviderAppClientTypeConfidential}
+	publicApp       = database.OAuth2ProviderApp{ClientType: database.OAuth2ProviderAppClientTypePublic}
+)
 
 // TestExtractTokenParams_Scopes tests OAuth2 scope parameter parsing
 // to ensure RFC 6749 compliance where scopes are space-delimited
@@ -126,7 +135,7 @@ func TestExtractTokenParams_Scopes(t *testing.T) {
 			}
 
 			// Extract token request
-			tokenReq, validationErrs, err := extractTokenRequest(req, callbackURL, database.OAuth2ProviderApp{})
+			tokenReq, validationErrs, err := extractTokenRequest(req, callbackURL, confidentialApp)
 
 			// Verify no errors occurred
 			require.NoError(t, err, "extractTokenRequest should not return error for: %s", tc.description)
@@ -189,7 +198,7 @@ func TestExtractTokenParams_ScopesURLEncoded(t *testing.T) {
 			}
 
 			// Extract token request
-			tokenReq, validationErrs, err := extractTokenRequest(req, callbackURL, database.OAuth2ProviderApp{})
+			tokenReq, validationErrs, err := extractTokenRequest(req, callbackURL, confidentialApp)
 
 			// Verify no errors
 			require.NoError(t, err)
@@ -269,7 +278,7 @@ func TestExtractTokenParams_ScopesEdgeCases(t *testing.T) {
 				Form:     form,
 			}
 
-			tokenReq, validationErrs, err := extractTokenRequest(req, callbackURL, database.OAuth2ProviderApp{})
+			tokenReq, validationErrs, err := extractTokenRequest(req, callbackURL, confidentialApp)
 
 			require.NoError(t, err, "extractTokenRequest should not error for: %s", tc.description)
 			require.Empty(t, validationErrs)
@@ -380,9 +389,6 @@ func TestExtractAuthorizeParams_TokenResponseTypeDoesNotRequirePKCE(t *testing.T
 func TestExtractTokenRequest_ClientSecretRequirement(t *testing.T) {
 	t.Parallel()
 
-	confidential := database.OAuth2ProviderApp{ClientType: sql.NullString{String: "confidential", Valid: true}}
-	public := database.OAuth2ProviderApp{ClientType: sql.NullString{String: "public", Valid: true}}
-
 	testCases := []struct {
 		name string
 		app  database.OAuth2ProviderApp
@@ -395,49 +401,33 @@ func TestExtractTokenRequest_ClientSecretRequirement(t *testing.T) {
 	}{
 		{
 			name:           "ConfidentialClientMissingSecretIsRejected",
-			app:            confidential,
+			app:            confidentialApp,
 			clientID:       "test-client",
 			wantErrorField: "client_secret",
 		},
 		{
 			name:         "ConfidentialClientWithSecretIsAccepted",
-			app:          confidential,
+			app:          confidentialApp,
 			clientID:     "test-client",
 			clientSecret: "test-secret",
 		},
 		{
 			name:     "PublicClientMissingSecretIsAccepted",
-			app:      public,
+			app:      publicApp,
 			clientID: "test-client",
 		},
 		{
 			// A public client that sends a secret anyway is accepted; the
 			// secret is simply never checked (RFC 6749 §2.3.1).
 			name:         "PublicClientWithSecretIsAccepted",
-			app:          public,
+			app:          publicApp,
 			clientID:     "test-client",
 			clientSecret: "unnecessary-secret",
 		},
 		{
 			name:           "PublicClientMissingClientIDIsRejected",
-			app:            public,
+			app:            publicApp,
 			wantErrorField: "client_id",
-		},
-		{
-			// A zero-value app (ClientType.String == "") must be treated as
-			// confidential, not public, so a bug can't accidentally widen
-			// which apps skip the secret check.
-			name:           "ZeroValueClientTypeDefaultsToRequiringSecret",
-			app:            database.OAuth2ProviderApp{},
-			clientID:       "test-client",
-			wantErrorField: "client_secret",
-		},
-		{
-			// Likewise for a client_type the server doesn't recognize.
-			name:           "UnrecognizedClientTypeDefaultsToRequiringSecret",
-			app:            database.OAuth2ProviderApp{ClientType: sql.NullString{String: "Public", Valid: true}},
-			clientID:       "test-client",
-			wantErrorField: "client_secret",
 		},
 	}
 
@@ -500,7 +490,7 @@ func TestRefreshTokenGrant_Scopes(t *testing.T) {
 		Form:     form,
 	}
 
-	tokenReq, validationErrs, err := extractTokenRequest(req, callbackURL, database.OAuth2ProviderApp{})
+	tokenReq, validationErrs, err := extractTokenRequest(req, callbackURL, confidentialApp)
 
 	require.NoError(t, err)
 	require.Empty(t, validationErrs)

@@ -6431,18 +6431,9 @@ export interface OAuth2ClientRegistrationResponse {
 }
 
 // From codersdk/oauth2.go
-/**
- * OAuth2 client types (RFC 7591 §2, OAuth 2.1 §2.1). A confidential client
- * authenticates with a secret; a public client authenticates with PKCE alone.
- */
-export const OAuth2ClientTypeConfidential = "confidential";
+export type OAuth2ClientType = "confidential" | "public";
 
-// From codersdk/oauth2.go
-/**
- * OAuth2 client types (RFC 7591 §2, OAuth 2.1 §2.1). A confidential client
- * authenticates with a secret; a public client authenticates with PKCE alone.
- */
-export const OAuth2ClientTypePublic = "public";
+export const OAuth2ClientTypes: OAuth2ClientType[] = ["confidential", "public"];
 
 // From codersdk/deployment.go
 export interface OAuth2Config {

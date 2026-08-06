@@ -176,12 +176,18 @@ func TestCreateDynamicClientRegistration_ClientType(t *testing.T) {
 			var resp codersdk.OAuth2ClientRegistrationResponse
 			require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &resp))
 
-			// RFC 7591 §3.2.1: client_secret is omitted entirely for a
-			// client that was not issued one.
+			// RFC 7591 §3.2.1: client_secret is omitted entirely for a client
+			// that was not issued one. Assert against the raw body, because a
+			// decoded struct cannot tell an absent key from a present empty
+			// one, and key presence is exactly what a client branches on. The
+			// docs promise the field is absent, so that is what to pin.
+			var rawBody map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(rw.Body.Bytes(), &rawBody))
 			if tt.wantSecret {
+				require.Contains(t, rawBody, "client_secret")
 				require.NotEmpty(t, resp.ClientSecret)
 			} else {
-				require.Empty(t, resp.ClientSecret)
+				require.NotContains(t, rawBody, "client_secret")
 			}
 
 			clientID, err := uuid.Parse(resp.ClientID)
@@ -189,7 +195,7 @@ func TestCreateDynamicClientRegistration_ClientType(t *testing.T) {
 
 			app, err := db.GetOAuth2ProviderAppByClientID(ctx, clientID)
 			require.NoError(t, err)
-			require.Equal(t, tt.wantClientType, app.ClientType.String)
+			require.Equal(t, tt.wantClientType, app.ClientType)
 
 			secrets, err := db.GetOAuth2ProviderAppSecretsByAppID(ctx, clientID)
 			require.NoError(t, err)
@@ -243,27 +249,35 @@ func TestCreateDynamicClientRegistration_Transaction(t *testing.T) {
 
 			ctrl := gomock.NewController(t)
 			mDB := dbmock.NewMockStore(ctrl)
+			// A separate handle for the transaction, so a call made on the
+			// outer store is distinguishable from one made on tx.
+			mTx := dbmock.NewMockStore(ctrl)
 
 			mDB.EXPECT().GetOAuth2DCREnabled(gomock.Any()).Return(true, nil).Times(1)
 
-			// InTx must invoke the closure against the same store handle
-			// (the mock itself, standing in for `tx`) so the two inserts
-			// below are recorded as happening inside one shared
-			// transaction, not as two independently committed statements.
 			mDB.EXPECT().InTx(gomock.Any(), gomock.Any()).DoAndReturn(
 				func(f func(database.Store) error, _ *database.TxOptions) error {
-					return f(mDB)
+					return f(mTx)
 				},
 			).Times(1)
 
-			appCall := mDB.EXPECT().InsertOAuth2ProviderApp(gomock.Any(), gomock.Any()).
+			// Both expectations live on mTx, not mDB, and that is the
+			// assertion. An insert issued on the outer store, whether after
+			// InTx returns or from inside the closure against the wrong
+			// handle, lands on mDB, which has no expectation for it, so
+			// gomock fails the unexpected call. Registering both on a single
+			// mock makes inside and outside the transaction indistinguishable
+			// and the test then passes either way, which is the trap the
+			// project's own InTx rule exists to catch
+			// (.claude/docs/DATABASE.md).
+			appCall := mTx.EXPECT().InsertOAuth2ProviderApp(gomock.Any(), gomock.Any()).
 				Return(database.OAuth2ProviderApp{
 					ID:         uuid.New(),
-					ClientType: sql.NullString{String: "confidential", Valid: true},
+					ClientType: database.OAuth2ProviderAppClientTypeConfidential,
 				}, nil).
 				Times(1)
 
-			secretCall := mDB.EXPECT().InsertOAuth2ProviderAppSecret(gomock.Any(), gomock.Any()).
+			secretCall := mTx.EXPECT().InsertOAuth2ProviderAppSecret(gomock.Any(), gomock.Any()).
 				Return(database.OAuth2ProviderAppSecret{}, tt.secretInsertErr).
 				Times(1)
 
@@ -303,21 +317,24 @@ func TestCreateDynamicClientRegistration_PublicClientSkipsSecretInsert(t *testin
 
 	ctrl := gomock.NewController(t)
 	mDB := dbmock.NewMockStore(ctrl)
+	mTx := dbmock.NewMockStore(ctrl)
 
 	mDB.EXPECT().GetOAuth2DCREnabled(gomock.Any()).Return(true, nil).Times(1)
 	mDB.EXPECT().InTx(gomock.Any(), gomock.Any()).DoAndReturn(
 		func(f func(database.Store) error, _ *database.TxOptions) error {
-			return f(mDB)
+			return f(mTx)
 		},
 	).Times(1)
-	mDB.EXPECT().InsertOAuth2ProviderApp(gomock.Any(), gomock.Any()).
+	mTx.EXPECT().InsertOAuth2ProviderApp(gomock.Any(), gomock.Any()).
 		Return(database.OAuth2ProviderApp{
 			ID:         uuid.New(),
-			ClientType: sql.NullString{String: "public", Valid: true},
+			ClientType: database.OAuth2ProviderAppClientTypePublic,
 		}, nil).
 		Times(1)
-	// The absence of an InsertOAuth2ProviderAppSecret expectation is the
-	// assertion: gomock fails on an unexpected call.
+	// The absence of an InsertOAuth2ProviderAppSecret expectation on either
+	// handle is the assertion: gomock fails on an unexpected call. This only
+	// holds because the two handles are distinct, so a secret insert issued
+	// anywhere is unexpected rather than absorbed by a shared expectation.
 
 	logger := slogtest.Make(t, nil)
 	auditor := audit.NewNop()
@@ -352,12 +369,20 @@ func TestUpdateClientConfiguration_ClientTypeIsImmutable(t *testing.T) {
 	require.NoError(t, err)
 
 	tests := []struct {
-		name              string
-		registerAs        codersdk.OAuth2TokenEndpointAuthMethod
-		updateTo          codersdk.OAuth2TokenEndpointAuthMethod
+		name       string
+		registerAs codersdk.OAuth2TokenEndpointAuthMethod
+		updateTo   codersdk.OAuth2TokenEndpointAuthMethod
+		// omitAuthMethod sends the update with no token_endpoint_auth_method at
+		// all, which ApplyDefaults rewrites to client_secret_basic before the
+		// guard sees it. updateTo is ignored when set.
+		omitAuthMethod    bool
 		wantStatus        int
 		wantFinalCallback string
-		wantClientType    string
+		// wantClientType is deliberately a bare literal rather than the
+		// database constant: it pins the value actually stored in the column,
+		// so it must fail if that spelling ever changes. Fixtures that set
+		// state use the constant instead.
+		wantClientType string
 	}{
 		{
 			name:           "ConfidentialToPublicIsRejected",
@@ -374,10 +399,33 @@ func TestUpdateClientConfiguration_ClientTypeIsImmutable(t *testing.T) {
 			wantClientType: "public",
 		},
 		{
+			// RFC 7592 makes PUT a full replacement, so an omitted auth method
+			// defaults to client_secret_basic and moves a public client to
+			// confidential, which is rejected. The rejection is correct; what
+			// matters is that it is reported in terms the caller can act on,
+			// since they never sent the field named in the error.
+			name:           "PublicWithOmittedAuthMethodIsRejected",
+			registerAs:     codersdk.OAuth2TokenEndpointAuthMethodNone,
+			omitAuthMethod: true,
+			wantStatus:     http.StatusBadRequest,
+			wantClientType: "public",
+		},
+		{
 			// Both are confidential, so the guard must not fire.
 			name:              "BasicToPostIsAllowed",
 			registerAs:        codersdk.OAuth2TokenEndpointAuthMethodClientSecretBasic,
 			updateTo:          codersdk.OAuth2TokenEndpointAuthMethodClientSecretPost,
+			wantStatus:        http.StatusOK,
+			wantFinalCallback: "https://example.com/updated-callback",
+			wantClientType:    "confidential",
+		},
+		{
+			// A confidential client omitting the field is unaffected, because
+			// the default it lands on is also confidential. Pinned so the
+			// asymmetry with the public case above stays visible.
+			name:              "ConfidentialWithOmittedAuthMethodIsAllowed",
+			registerAs:        codersdk.OAuth2TokenEndpointAuthMethodClientSecretPost,
+			omitAuthMethod:    true,
 			wantStatus:        http.StatusOK,
 			wantFinalCallback: "https://example.com/updated-callback",
 			wantClientType:    "confidential",
@@ -424,10 +472,13 @@ func TestUpdateClientConfiguration_ClientTypeIsImmutable(t *testing.T) {
 			require.NoError(t, err)
 
 			updateHandler := tracing.StatusWriterMiddleware(oauth2provider.UpdateClientConfiguration(db, &auditor, logger))
-			updateBody, err := json.Marshal(codersdk.OAuth2ClientRegistrationRequest{
-				RedirectURIs:            []string{"https://example.com/updated-callback"},
-				TokenEndpointAuthMethod: tt.updateTo,
-			})
+			updateReqBody := codersdk.OAuth2ClientRegistrationRequest{
+				RedirectURIs: []string{"https://example.com/updated-callback"},
+			}
+			if !tt.omitAuthMethod {
+				updateReqBody.TokenEndpointAuthMethod = tt.updateTo
+			}
+			updateBody, err := json.Marshal(updateReqBody)
 			require.NoError(t, err)
 
 			// The handler reads client_id via chi.URLParam, which normally
@@ -448,12 +499,22 @@ func TestUpdateClientConfiguration_ClientTypeIsImmutable(t *testing.T) {
 			// client_type is what IsPublic() reads to decide whether the token
 			// endpoint validates a secret, so it must be unchanged whether the
 			// update was accepted or rejected.
-			require.Equal(t, tt.wantClientType, app.ClientType.String)
+			require.Equal(t, tt.wantClientType, app.ClientType)
 
 			if tt.wantStatus != http.StatusOK {
 				var errResp map[string]string
 				require.NoError(t, json.Unmarshal(updateRW.Body.Bytes(), &errResp))
 				require.Equal(t, "invalid_client_metadata", errResp["error"])
+				// The error code alone cannot distinguish this guard from
+				// req.Validate() failing, which returns the same one, and
+				// neither can the untouched row below. The description is the
+				// only field that tells them apart, so assert on it: a change
+				// that made "none" fail validation outright would otherwise
+				// leave these cases green while testing something else.
+				require.Contains(t, errResp["error_description"], "cannot move an existing client between public and confidential")
+				// It must also name what the server actually compared, since
+				// the caller may never have sent the field.
+				require.Contains(t, errResp["error_description"], "client_secret_basic")
 				// The rejection must leave the whole update unapplied, not
 				// just the client_type field.
 				require.Equal(t, "https://example.com/callback", app.CallbackURL)
@@ -461,7 +522,12 @@ func TestUpdateClientConfiguration_ClientTypeIsImmutable(t *testing.T) {
 			}
 
 			require.Equal(t, tt.wantFinalCallback, app.CallbackURL)
-			require.Equal(t, string(tt.updateTo), app.TokenEndpointAuthMethod.String)
+			wantMethod := tt.updateTo
+			if tt.omitAuthMethod {
+				// ApplyDefaults substitutes the RFC 7591 default.
+				wantMethod = codersdk.OAuth2TokenEndpointAuthMethodClientSecretBasic
+			}
+			require.Equal(t, string(wantMethod), app.TokenEndpointAuthMethod.String)
 		})
 	}
 }
@@ -510,7 +576,7 @@ func TestUpdateClientConfiguration_LegacyAuthMethodMismatch(t *testing.T) {
 			legacy := dbgen.OAuth2ProviderApp(t, db, database.OAuth2ProviderApp{
 				CallbackURL:             "https://example.com/callback",
 				RedirectUris:            []string{"https://example.com/callback"},
-				ClientType:              sql.NullString{String: "confidential", Valid: true},
+				ClientType:              database.OAuth2ProviderAppClientTypeConfidential,
 				TokenEndpointAuthMethod: sql.NullString{String: "none", Valid: true},
 				DynamicallyRegistered:   sql.NullBool{Bool: true, Valid: true},
 			})
@@ -545,7 +611,7 @@ func TestUpdateClientConfiguration_LegacyAuthMethodMismatch(t *testing.T) {
 			// The update must not convert the client to public. It still holds
 			// a secret, and IsPublic() reading "public" here would stop the
 			// token endpoint from requiring it.
-			require.Equal(t, "confidential", app.ClientType.String)
+			require.Equal(t, "confidential", app.ClientType)
 			require.False(t, app.IsPublic())
 			secrets, err := db.GetOAuth2ProviderAppSecretsByAppID(ctx, legacy.ID)
 			require.NoError(t, err)

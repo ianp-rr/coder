@@ -116,7 +116,7 @@ func CreateDynamicClientRegistration(db database.Store, accessURL *url.URL, audi
 				Icon:                    req.LogoURI,
 				CallbackURL:             req.RedirectURIs[0], // Primary redirect URI
 				RedirectUris:            req.RedirectURIs,
-				ClientType:              sql.NullString{String: clientType, Valid: true},
+				ClientType:              string(clientType),
 				DynamicallyRegistered:   sql.NullBool{Bool: true, Valid: true},
 				ClientIDIssuedAt:        sql.NullTime{Time: now, Valid: true},
 				ClientSecretExpiresAt:   sql.NullTime{}, // No expiration for now
@@ -134,7 +134,10 @@ func CreateDynamicClientRegistration(db database.Store, accessURL *url.URL, audi
 				SoftwareID:              sql.NullString{String: req.SoftwareID, Valid: req.SoftwareID != ""},
 				SoftwareVersion:         sql.NullString{String: req.SoftwareVersion, Valid: req.SoftwareVersion != ""},
 				RegistrationAccessToken: hashedRegToken,
-				RegistrationClientUri:   sql.NullString{String: fmt.Sprintf("%s/oauth2/clients/%s", accessURL.String(), clientID), Valid: true},
+				// JoinPath, not Sprintf: an access URL configured with a
+				// trailing slash would otherwise mint "//oauth2/clients/{id}"
+				// and hand it to the client as its management endpoint.
+				RegistrationClientUri: sql.NullString{String: accessURL.JoinPath("/oauth2/clients", clientID.String()).String(), Valid: true},
 			})
 			if err != nil {
 				return xerrors.Errorf("insert oauth2 provider app: %w", err)
@@ -196,7 +199,7 @@ func CreateDynamicClientRegistration(db database.Store, accessURL *url.URL, audi
 			SoftwareVersion:         app.SoftwareVersion.String,
 			GrantTypes:              slice.StringEnums[codersdk.OAuth2ProviderGrantType](app.GrantTypes),
 			ResponseTypes:           slice.StringEnums[codersdk.OAuth2ProviderResponseType](app.ResponseTypes),
-			TokenEndpointAuthMethod: codersdk.OAuth2TokenEndpointAuthMethod(app.TokenEndpointAuthMethod.String),
+			TokenEndpointAuthMethod: reportedAuthMethod(app),
 			Scope:                   app.Scope.String,
 			Contacts:                app.Contacts,
 			RegistrationAccessToken: registrationToken,
@@ -222,7 +225,7 @@ func GetClientConfiguration(db database.Store) http.HandlerFunc {
 		}
 
 		// Get app by client ID
-		//nolint:gocritic // OAuth2 system context — RFC 7592 client configuration endpoint
+		//nolint:gocritic // OAuth2 system context, RFC 7592 client configuration endpoint
 		app, err := db.GetOAuth2ProviderAppByClientID(dbauthz.AsSystemOAuth2(ctx), clientID)
 		if err != nil {
 			if xerrors.Is(err, sql.ErrNoRows) {
@@ -259,7 +262,7 @@ func GetClientConfiguration(db database.Store) http.HandlerFunc {
 			SoftwareVersion:         app.SoftwareVersion.String,
 			GrantTypes:              slice.StringEnums[codersdk.OAuth2ProviderGrantType](app.GrantTypes),
 			ResponseTypes:           slice.StringEnums[codersdk.OAuth2ProviderResponseType](app.ResponseTypes),
-			TokenEndpointAuthMethod: codersdk.OAuth2TokenEndpointAuthMethod(app.TokenEndpointAuthMethod.String),
+			TokenEndpointAuthMethod: reportedAuthMethod(app),
 			Scope:                   app.Scope.String,
 			Contacts:                app.Contacts,
 			RegistrationAccessToken: "", // RFC 7592: Not returned in GET responses for security
@@ -308,7 +311,7 @@ func UpdateClientConfiguration(db database.Store, auditor *audit.Auditor, logger
 		req = req.ApplyDefaults()
 
 		// Get existing app to verify it exists and is dynamically registered
-		//nolint:gocritic // OAuth2 system context — RFC 7592 client configuration endpoint
+		//nolint:gocritic // OAuth2 system context, RFC 7592 client configuration endpoint
 		existingApp, err := db.GetOAuth2ProviderAppByClientID(dbauthz.AsSystemOAuth2(ctx), clientID)
 		if err == nil {
 			aReq.Old = existingApp
@@ -333,34 +336,34 @@ func UpdateClientConfiguration(db database.Store, auditor *audit.Auditor, logger
 
 		// A client's type is fixed at registration (RFC 7592 §2.2 permits
 		// rejecting metadata the server will not accept). Flipping it would
-		// either drop the secret requirement for a client that has one, or
-		// mark a client confidential when it has no secret and no way to be
-		// issued one.
+		// either drop the secret requirement for a client that has one, or mark
+		// a client confidential when it has no secret and no way to be issued
+		// one.
 		//
-		// Only an update that actually changes token_endpoint_auth_method is
-		// rejected. Clients registered before client_type was derived from the
-		// auth method can have the two disagree: the auth method was persisted
-		// verbatim while the type was always "confidential", so an app can be
-		// stored as confidential with an auth method of "none". Comparing the
-		// derived type alone would reject those clients forever, including when
-		// they resend the exact metadata GET reports, leaving re-registration as
-		// the only recovery.
-		//
-		// Comparing derived types rather than raw auth methods keeps
-		// client_secret_basic and client_secret_post interchangeable, since both
-		// are confidential.
-		clientType := req.DetermineClientType()
-		if req.TokenEndpointAuthMethod != codersdk.OAuth2TokenEndpointAuthMethod(existingApp.TokenEndpointAuthMethod.String) &&
-			clientType != existingApp.ClientType.String {
+		// The first conjunct only rejects an update that actually changes the
+		// auth method, which lets a legacy row whose two columns disagree still
+		// manage itself. IsPublic is the reader for the stored column so an
+		// unrecognized value is treated as confidential here exactly as it is at
+		// the token endpoint.
+		storedMethod := codersdk.OAuth2TokenEndpointAuthMethod(existingApp.TokenEndpointAuthMethod.String)
+		requestedClientType := req.DetermineClientType()
+		if req.TokenEndpointAuthMethod != storedMethod &&
+			(requestedClientType == codersdk.OAuth2ClientTypePublic) != existingApp.IsPublic() {
+			logger.Warn(ctx, "rejected oauth2 client type change",
+				slog.F("client_id", clientID.String()),
+				slog.F("stored_token_endpoint_auth_method", existingApp.TokenEndpointAuthMethod.String),
+				slog.F("requested_token_endpoint_auth_method", string(req.TokenEndpointAuthMethod)),
+				slog.F("stored_client_type", existingApp.ClientType))
 			writeOAuth2RegistrationError(ctx, rw, http.StatusBadRequest,
 				"invalid_client_metadata",
-				"token_endpoint_auth_method cannot change an existing client between public and confidential")
+				fmt.Sprintf("token_endpoint_auth_method cannot move an existing client between public and confidential (stored %q, requested %q); the client type is fixed at registration, so register a new client instead",
+					existingApp.TokenEndpointAuthMethod.String, string(req.TokenEndpointAuthMethod)))
 			return
 		}
 
 		// Update app in database
 		now := dbtime.Now()
-		//nolint:gocritic // OAuth2 system context — RFC 7592 client configuration endpoint
+		//nolint:gocritic // OAuth2 system context, RFC 7592 client configuration endpoint
 		updatedApp, err := db.UpdateOAuth2ProviderAppByClientID(dbauthz.AsSystemOAuth2(ctx), database.UpdateOAuth2ProviderAppByClientIDParams{
 			ID:           clientID,
 			UpdatedAt:    now,
@@ -415,7 +418,7 @@ func UpdateClientConfiguration(db database.Store, auditor *audit.Auditor, logger
 			SoftwareVersion:         updatedApp.SoftwareVersion.String,
 			GrantTypes:              slice.StringEnums[codersdk.OAuth2ProviderGrantType](updatedApp.GrantTypes),
 			ResponseTypes:           slice.StringEnums[codersdk.OAuth2ProviderResponseType](updatedApp.ResponseTypes),
-			TokenEndpointAuthMethod: codersdk.OAuth2TokenEndpointAuthMethod(updatedApp.TokenEndpointAuthMethod.String),
+			TokenEndpointAuthMethod: reportedAuthMethod(updatedApp),
 			Scope:                   updatedApp.Scope.String,
 			Contacts:                updatedApp.Contacts,
 			RegistrationAccessToken: "", // RFC 7592: Not returned for security
@@ -448,7 +451,7 @@ func DeleteClientConfiguration(db database.Store, auditor *audit.Auditor, logger
 		}
 
 		// Get existing app to verify it exists and is dynamically registered
-		//nolint:gocritic // OAuth2 system context — RFC 7592 client configuration endpoint
+		//nolint:gocritic // OAuth2 system context, RFC 7592 client configuration endpoint
 		existingApp, err := db.GetOAuth2ProviderAppByClientID(dbauthz.AsSystemOAuth2(ctx), clientID)
 		if err == nil {
 			aReq.Old = existingApp
@@ -472,7 +475,7 @@ func DeleteClientConfiguration(db database.Store, auditor *audit.Auditor, logger
 		}
 
 		// Delete the client and all associated data (tokens, secrets, etc.)
-		//nolint:gocritic // OAuth2 system context — RFC 7592 client configuration endpoint
+		//nolint:gocritic // OAuth2 system context, RFC 7592 client configuration endpoint
 		err = db.DeleteOAuth2ProviderAppByClientID(dbauthz.AsSystemOAuth2(ctx), clientID)
 		if err != nil {
 			writeOAuth2RegistrationError(ctx, rw, http.StatusInternalServerError,
@@ -524,7 +527,7 @@ func RequireRegistrationAccessToken(db database.Store) func(http.Handler) http.H
 			}
 
 			// Get the client and verify the registration access token
-			//nolint:gocritic // OAuth2 system context — RFC 7592 registration access token validation
+			//nolint:gocritic // OAuth2 system context, RFC 7592 registration access token validation
 			app, err := db.GetOAuth2ProviderAppByClientID(dbauthz.AsSystemOAuth2(ctx), clientID)
 			if err != nil {
 				if xerrors.Is(err, sql.ErrNoRows) {
@@ -566,6 +569,29 @@ func RequireRegistrationAccessToken(db database.Store) func(http.Handler) http.H
 }
 
 // Helper functions for RFC 7591 Dynamic Client Registration
+
+// reportedAuthMethod returns the token_endpoint_auth_method to report for an
+// app, which is the stored value unless it contradicts the client type.
+//
+// The token endpoint enforces on client_type, so reporting a stored method that
+// disagrees with it would tell a client to authenticate in a way the server
+// will not accept. Clients registered before the type was derived from the
+// method can disagree, because the method was persisted verbatim while the type
+// was always "confidential": such an app is stored confidential with a method of
+// "none", and reporting "none" tells it to drop a secret its exchange still
+// requires. Reporting the enforced behavior instead also lets the row repair
+// itself, since the client's next PUT sends back a method that matches.
+func reportedAuthMethod(app database.OAuth2ProviderApp) codersdk.OAuth2TokenEndpointAuthMethod {
+	stored := codersdk.OAuth2TokenEndpointAuthMethod(app.TokenEndpointAuthMethod.String)
+	if stored.Valid() && (codersdk.ClientTypeFor(stored) == codersdk.OAuth2ClientTypePublic) == app.IsPublic() {
+		return stored
+	}
+	if app.IsPublic() {
+		return codersdk.OAuth2TokenEndpointAuthMethodNone
+	}
+	// RFC 7591 §2 default for a client that authenticates with a secret.
+	return codersdk.OAuth2TokenEndpointAuthMethodClientSecretBasic
+}
 
 // generateClientCredentials generates a client secret for OAuth2 apps
 func generateClientCredentials() (plaintext string, hashed []byte, err error) {

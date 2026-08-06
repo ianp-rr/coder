@@ -65,7 +65,7 @@ func TestOAuth2ClientRegistrationRequest_DetermineClientType(t *testing.T) {
 				req = req.ApplyDefaults()
 				require.Equal(t, codersdk.OAuth2TokenEndpointAuthMethodClientSecretBasic, req.TokenEndpointAuthMethod)
 			}
-			require.Equal(t, tt.expectedType, req.DetermineClientType())
+			require.Equal(t, tt.expectedType, string(req.DetermineClientType()))
 		})
 	}
 }
