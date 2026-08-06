@@ -14,6 +14,7 @@ import (
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog/v3"
+
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
@@ -63,10 +64,12 @@ func TestingBackupPollDuration(dur time.Duration) AcquirerOption {
 	}
 }
 
-// AcquirerStore is the subset of database.Store that the Acquirer needs
+// AcquirerStore is the subset of database.Store that the Acquirer needs. Job
+// acquisition runs in a transaction that locks the worker's deletable
+// provisioner key (LockProvisionerKeyByIDForShare) before claiming a job
+// (AcquireProvisionerJob), so a claim cannot commit after the key's deletion.
 type AcquirerStore interface {
-	AcquireProvisionerJob(context.Context, database.AcquireProvisionerJobParams) (database.ProvisionerJob, error)
-	GetProvisionerKeyByID(context.Context, uuid.UUID) (database.ProvisionerKey, error)
+	InTx(func(database.Store) error, *database.TxOptions) error
 }
 
 func NewAcquirer(ctx context.Context, logger slog.Logger, store AcquirerStore, ps pubsub.Pubsub,
@@ -127,44 +130,53 @@ func (a *Acquirer) AcquireJob(
 			return database.ProvisionerJob{}, err
 		case <-clearance:
 			logger.Debug(ctx, "got clearance to call database")
-			job, err := a.store.AcquireProvisionerJob(ctx, database.AcquireProvisionerJobParams{
-				OrganizationID: organization,
-				StartedAt: sql.NullTime{
-					Time:  dbtime.Now(),
-					Valid: true,
-				},
-				WorkerID: uuid.NullUUID{
-					UUID:  worker,
-					Valid: true,
-				},
-				Types:            pt,
-				ProvisionerTags:  dbTags,
-				ProvisionerKeyID: uuid.NullUUID{UUID: keyID, Valid: deletableKey},
-			})
-			if xerrors.Is(err, sql.ErrNoRows) {
-				// The claim query returns no rows both when no job is pending and
-				// when the worker's deletable key was deleted (deleted keys cannot
-				// lock jobs). Disambiguate so a dead-key acquiree exits instead of
-				// re-parking and consuming wakeups its peers could have used.
+			var job database.ProvisionerJob
+			err := a.store.InTx(func(tx database.Store) error {
 				if deletableKey {
-					_, kerr := a.store.GetProvisionerKeyByID(
+					// Lock the key for the rest of the transaction so the claim
+					// below cannot commit after the key's deletion. A missing row
+					// means the key was deleted.
+					_, err := tx.LockProvisionerKeyByIDForShare(
 						//nolint:gocritic // The acquire context has no actor that can
 						// read provisioner keys, so scope the read to this narrow subject.
 						dbauthz.AsSystemReadProvisionerDaemons(ctx), keyID)
-					if xerrors.Is(kerr, sql.ErrNoRows) {
-						logger.Debug(ctx, "provisioner key deleted, exiting acquire")
-						// cancel (not done) hands an in-progress clearance to another
-						// acquiree in the domain, re-dispatching the wakeup this
-						// acquiree consumed.
-						if internalError := a.cancel(dk, clearance); internalError != nil {
-							return database.ProvisionerJob{}, internalError
-						}
-						return database.ProvisionerJob{}, ErrProvisionerKeyDeleted
+					if xerrors.Is(err, sql.ErrNoRows) {
+						return ErrProvisionerKeyDeleted
 					}
-					if kerr != nil {
-						logger.Warn(ctx, "failed to check provisioner key after empty acquire", slog.Error(kerr))
+					if err != nil {
+						return xerrors.Errorf("lock provisioner key: %w", err)
 					}
 				}
+				acquired, err := tx.AcquireProvisionerJob(ctx, database.AcquireProvisionerJobParams{
+					OrganizationID: organization,
+					StartedAt: sql.NullTime{
+						Time:  dbtime.Now(),
+						Valid: true,
+					},
+					WorkerID: uuid.NullUUID{
+						UUID:  worker,
+						Valid: true,
+					},
+					Types:           pt,
+					ProvisionerTags: dbTags,
+				})
+				if err != nil {
+					return err
+				}
+				job = acquired
+				return nil
+			}, nil)
+			if xerrors.Is(err, ErrProvisionerKeyDeleted) {
+				logger.Debug(ctx, "provisioner key deleted, exiting acquire")
+				// cancel (not done) hands an in-progress clearance to another
+				// acquiree in the domain, re-dispatching the wakeup this
+				// acquiree consumed.
+				if internalError := a.cancel(dk, clearance); internalError != nil {
+					return database.ProvisionerJob{}, internalError
+				}
+				return database.ProvisionerJob{}, ErrProvisionerKeyDeleted
+			}
+			if xerrors.Is(err, sql.ErrNoRows) {
 				logger.Debug(ctx, "no job available")
 				continue
 			}

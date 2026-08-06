@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"cdr.dev/slog/v3/sloggers/slogtest"
+
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
@@ -2409,33 +2410,48 @@ func TestAcquireProvisionerJob(t *testing.T) {
 			require.NoError(t, err)
 			return job
 		}
-		acquire := func(keyID uuid.NullUUID) (database.ProvisionerJob, error) {
-			return db.AcquireProvisionerJob(ctx, database.AcquireProvisionerJobParams{
-				OrganizationID:   org.ID,
-				StartedAt:        sql.NullTime{Time: now, Valid: true},
-				WorkerID:         uuid.NullUUID{UUID: uuid.New(), Valid: true},
-				Types:            []database.ProvisionerType{database.ProvisionerTypeEcho},
-				ProvisionerTags:  json.RawMessage(`{}`),
-				ProvisionerKeyID: keyID,
-			})
+		// acquire mirrors the Acquirer's transaction: lock the key, then claim
+		// a job while the lock is held.
+		acquire := func(keyID uuid.UUID) (database.ProvisionerJob, error) {
+			var job database.ProvisionerJob
+			err := db.InTx(func(tx database.Store) error {
+				if keyID != uuid.Nil {
+					if _, err := tx.LockProvisionerKeyByIDForShare(ctx, keyID); err != nil {
+						return err
+					}
+				}
+				acquired, err := tx.AcquireProvisionerJob(ctx, database.AcquireProvisionerJobParams{
+					OrganizationID:  org.ID,
+					StartedAt:       sql.NullTime{Time: now, Valid: true},
+					WorkerID:        uuid.NullUUID{UUID: uuid.New(), Valid: true},
+					Types:           []database.ProvisionerType{database.ProvisionerTypeEcho},
+					ProvisionerTags: json.RawMessage(`{}`),
+				})
+				if err != nil {
+					return err
+				}
+				job = acquired
+				return nil
+			}, nil)
+			return job, err
 		}
 
-		// While the key exists, a keyed acquire claims the job.
+		// While the key exists, the lock succeeds and the claim proceeds.
 		job := insertPendingJob()
-		acquired, err := acquire(uuid.NullUUID{UUID: key.ID, Valid: true})
+		acquired, err := acquire(key.ID)
 		require.NoError(t, err)
 		require.Equal(t, job.ID, acquired.ID)
 
-		// Once the key is deleted, a keyed acquire claims nothing and the
-		// pending job is left untouched.
+		// Once the key is deleted, the lock reports no rows before any claim
+		// is attempted, and the pending job is left untouched.
 		pending := insertPendingJob()
 		err = db.DeleteProvisionerKey(ctx, key.ID)
 		require.NoError(t, err)
-		_, err = acquire(uuid.NullUUID{UUID: key.ID, Valid: true})
+		_, err = acquire(key.ID)
 		require.ErrorIs(t, err, sql.ErrNoRows)
 
 		// The job remains claimable by a worker without a key constraint.
-		acquired, err = acquire(uuid.NullUUID{})
+		acquired, err = acquire(uuid.Nil)
 		require.NoError(t, err)
 		require.Equal(t, pending.ID, acquired.ID)
 	})

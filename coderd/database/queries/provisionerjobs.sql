@@ -34,19 +34,6 @@ WHERE
 		SKIP LOCKED
 		LIMIT
 			1
-	)
-	-- When provisioner_key_id is set, the worker's key must still exist for the
-	-- claim to succeed. FOR KEY SHARE conflicts with DELETE on the key row, so a
-	-- claim that commits saw a live key and a committed deletion is seen by all
-	-- later claims. Reserved keys (built-in, user-auth, PSK) pass NULL and skip
-	-- the check, since they have no deletable row.
-	AND (
-		sqlc.narg('provisioner_key_id')::uuid IS NULL
-		OR EXISTS (
-			SELECT 1 FROM provisioner_keys
-			WHERE provisioner_keys.id = sqlc.narg('provisioner_key_id')::uuid
-			FOR KEY SHARE
-		)
 	) RETURNING *;
 
 -- name: GetProvisionerJobByID :one
